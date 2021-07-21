@@ -20,9 +20,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sys/wait.h>
-#ifdef __linux__
+#if defined(__linux__)
 #include <sys/prctl.h>
+#elif defined(__FreeBSD__)
+#include <sys/procctl.h>
 #endif
 
 namespace swoole {
@@ -69,13 +70,13 @@ void Manager::kill_timeout_process(Timer *timer, TimerNode *tnode) {
             continue;
         }
         if (swoole_kill(pid, SIGKILL) < 0) {
-            swSysWarn("swKill(%d, SIGKILL) [%u] failed", pid, worker_id);
+            swSysWarn("kill(%d, SIGKILL) [%u] failed", pid, worker_id);
         } else {
             swoole_error_log(SW_LOG_WARNING,
                              SW_ERROR_SERVER_WORKER_EXIT_TIMEOUT,
-                             "[Manager] Worker#%d[pid=%d] exit timeout, force kill the process",
-                             worker_id,
-                             pid);
+                             "worker(pid=%d, id=%d) exit timeout, force kill the process",
+                             pid,
+                             worker_id);
         }
     }
     errno = 0;
@@ -202,10 +203,10 @@ int Server::start_manager_process() {
 
 void Server::check_worker_exit_status(int worker_id, const ExitStatus &exit_status) {
     if (exit_status.get_status() != 0) {
-        swWarn("worker#%d[pid=%d] abnormal exit, status=%d, signal=%d"
+        swWarn("worker(pid=%d, id=%d) abnormal exit, status=%d, signal=%d"
                "%s",
-               worker_id,
                exit_status.get_pid(),
+               worker_id,
                exit_status.get_code(),
                exit_status.get_signal(),
                exit_status.get_signal() == SIGSEGV ? "\n" SWOOLE_BUG_REPORT : "");
@@ -241,8 +242,11 @@ void Manager::start(Server *_server) {
     swSignal_set(SIGRTMIN, signal_handler);
 #endif
     // swSignal_set(SIGINT, signal_handler);
-#ifdef __linux__
+#if defined(__linux__)
     prctl(PR_SET_PDEATHSIG, SIGTERM);
+#elif defined(__FreeBSD__)
+    int sigid = SIGTERM;
+    procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sigid);
 #endif
 
     if (_server->hooks[Server::HOOK_MANAGER_START]) {

@@ -16,7 +16,6 @@
 
 #include "swoole_server.h"
 #include "swoole_memory.h"
-#include "swoole_http.h"
 #include "swoole_lock.h"
 #include "swoole_util.h"
 
@@ -31,14 +30,6 @@ swoole::Server *g_server_instance = nullptr;
 namespace swoole {
 
 static void Server_signal_handler(int sig);
-
-static void **Server_worker_create_buffers(Server *serv, uint32_t buffer_num);
-static void Server_worker_free_buffers(Server *serv, uint32_t buffer_num, void **buffers);
-static void *Server_worker_get_buffer(Server *serv, DataHead *info);
-static size_t Server_worker_get_buffer_len(Server *serv, DataHead *info);
-static void Server_worker_add_buffer_len(Server *serv, DataHead *info, size_t len);
-static void Server_worker_move_buffer(Server *serv, PipeBuffer *buffer);
-static size_t Server_worker_get_packet(Server *serv, EventData *req, char **data_ptr);
 
 TimerCallback Server::get_timeout_callback(ListenPort *port, Reactor *reactor, Connection *conn) {
     return [this, port, conn, reactor](Timer *, TimerNode *) {
@@ -324,6 +315,13 @@ int Server::start_check() {
     if (send_timeout > 0 && send_timeout < SW_TIMER_MIN_SEC) {
         send_timeout = SW_TIMER_MIN_SEC;
     }
+    if (heartbeat_check_interval > 0) {
+        for (auto ls : ports) {
+            if (ls->heartbeat_idle_time == 0) {
+                ls->heartbeat_idle_time = heartbeat_check_interval * 2;
+            }
+        }
+    }
     for (auto ls : ports) {
         if (ls->protocol.package_max_length < SW_BUFFER_MIN_SIZE) {
             ls->protocol.package_max_length = SW_BUFFER_MIN_SIZE;
@@ -335,6 +333,12 @@ int Server::start_check() {
         if (if_require_packet_callback(ls, onPacket != nullptr)) {
             swWarn("require onPacket callback");
             return SW_ERR;
+        }
+        if (ls->heartbeat_idle_time > 0) {
+            int expect_heartbeat_check_interval = ls->heartbeat_idle_time > 2 ? ls->heartbeat_idle_time / 2 : 1;
+            if (heartbeat_check_interval == 0 || heartbeat_check_interval > expect_heartbeat_check_interval) {
+                heartbeat_check_interval = expect_heartbeat_check_interval;
+            }
         }
     }
 #ifdef SW_USE_OPENSSL
@@ -365,28 +369,12 @@ void Server::store_listen_socket() {
     }
 }
 
-static void **Server_worker_create_buffers(Server *serv, uint32_t buffer_num) {
-    String **buffers = new String *[buffer_num];
-    for (uint i = 0; i < buffer_num; i++) {
-        buffers[i] = new String(SW_BUFFER_SIZE_BIG);
-    }
-    return (void **) buffers;
-}
-
-static void Server_worker_free_buffers(Server *serv, uint32_t buffer_num, void **_buffers) {
-    String **buffers = (String **) _buffers;
-    for (uint i = 0; i < buffer_num; i++) {
-        delete buffers[i];
-    }
-    delete[] buffers;
-}
-
 /**
  * only the memory of the Worker structure is allocated, no process is fork
  */
 int Server::create_task_workers() {
     key_t key = 0;
-    int ipc_mode;
+    swIPC_type ipc_mode;
 
     if (task_ipc_mode == SW_TASK_IPC_MSGQUEUE || task_ipc_mode == SW_TASK_IPC_PREEMPTIVE) {
         key = message_queue_key;
@@ -398,7 +386,8 @@ int Server::create_task_workers() {
     }
 
     ProcessPool *pool = &gs->task_workers;
-    if (ProcessPool::create(pool, task_worker_num, key, ipc_mode) < 0) {
+    *pool = {};
+    if (pool->create(task_worker_num, key, ipc_mode) < 0) {
         swWarn("[Master] create task_workers failed");
         return SW_ERR;
     }
@@ -410,7 +399,7 @@ int Server::create_task_workers() {
     if (ipc_mode == SW_IPC_SOCKET) {
         char sockfile[sizeof(struct sockaddr_un)];
         snprintf(sockfile, sizeof(sockfile), "/tmp/swoole.task.%d.sock", gs->master_pid);
-        if (gs->task_workers.create_unix_socket(sockfile, 2048) < 0) {
+        if (gs->task_workers.listen(sockfile, 2048) < 0) {
             return SW_ERR;
         }
     }
@@ -477,11 +466,6 @@ void Server::init_worker(Worker *worker) {
 #endif
     // signal init
     worker_signal_init();
-
-    worker_input_buffers = (void **) create_buffers(this, get_worker_buffer_num());
-    if (!worker_input_buffers) {
-        swError("failed to create worker buffers");
-    }
 
     if (max_request < 1) {
         SwooleWG.run_always = true;
@@ -664,16 +648,9 @@ Server::Server(enum Mode _mode) {
     if (gs == nullptr) {
         swError("[Master] Fatal Error: failed to allocate memory for Server->gs");
     }
-    /**
-     * init method
-     */
-    create_buffers = Server_worker_create_buffers;
-    free_buffers = Server_worker_free_buffers;
-    get_buffer = Server_worker_get_buffer;
-    get_buffer_len = Server_worker_get_buffer_len;
-    add_buffer_len = Server_worker_add_buffer_len;
-    move_buffer = Server_worker_move_buffer;
-    get_packet = Server_worker_get_packet;
+
+    worker_msg_id = 1;
+    worker_buffer_allocator = sw_std_allocator();
 
     g_server_instance = this;
 }
@@ -987,6 +964,17 @@ int Server::schedule_worker(int fd, SendData *data) {
         } else {
             key = conn->uid;
         }
+    } else if (dispatch_mode == SW_DISPATCH_CO_CONN_LB) {
+        Connection *conn = get_connection(fd);
+        if (conn == nullptr) {
+            return key % worker_num;
+        }
+        if (conn->worker_id < 0) {
+            conn->worker_id = get_lowest_load_worker_id();
+        }
+        return conn->worker_id;
+    } else if (dispatch_mode == SW_DISPATCH_CO_REQ_LB) {
+        return get_lowest_load_worker_id();
     }
     // Preemptive distribution
     else {
@@ -1005,6 +993,7 @@ int Server::schedule_worker(int fd, SendData *data) {
         swTraceLog(SW_TRACE_SERVER, "schedule=%d, round=%d", key, worker_round_id);
         return key;
     }
+
     return key % worker_num;
 }
 
@@ -1152,7 +1141,8 @@ int Server::send_to_connection(SendData *_send) {
     else {
         // connection is closed
         if (conn->peer_closed) {
-            swWarn("connection#%d is closed by client", fd);
+            swoole_error_log(
+                SW_LOG_NOTICE, SW_ERROR_SESSION_CLOSED_BY_CLIENT, "Server::send(): socket#%d is closed by client", fd);
             return false;
         }
         // connection output buffer overflow
@@ -1160,8 +1150,10 @@ int Server::send_to_connection(SendData *_send) {
             if (send_yield) {
                 swoole_set_last_error(SW_ERROR_OUTPUT_SEND_YIELD);
             } else {
-                swoole_error_log(
-                    SW_LOG_WARNING, SW_ERROR_OUTPUT_BUFFER_OVERFLOW, "connection#%d output buffer overflow", fd);
+                swoole_error_log(SW_LOG_WARNING,
+                                 SW_ERROR_OUTPUT_BUFFER_OVERFLOW,
+                                 "Server::send(): connection#%d output buffer overflow",
+                                 fd);
             }
             conn->overflow = 1;
             if (onBufferEmpty && onBufferFull == nullptr) {
@@ -1186,9 +1178,8 @@ int Server::send_to_connection(SendData *_send) {
         _socket->send_timer = swoole_timer_add(port->max_idle_time * 1000, true, timeout_callback);
     }
 
-    // listen EPOLLOUT event
-    if (reactor->set(_socket, SW_EVENT_WRITE | SW_EVENT_READ) < 0 && (errno == EBADF || errno == ENOENT)) {
-        goto _close_fd;
+    if (!_socket->isset_writable_event()) {
+        reactor->add_write_event(_socket);
     }
 
     return SW_OK;
@@ -1276,40 +1267,7 @@ bool Server::sendwait(SessionId session_id, const void *data, uint32_t length) {
     return conn->socket->send_blocking(data, length) == length;
 }
 
-static sw_inline void Server_worker_set_buffer(Server *serv, DataHead *info, String *addr) {
-    String **buffers = (String **) serv->worker_input_buffers;
-    buffers[info->reactor_id] = addr;
-}
-
-static void *Server_worker_get_buffer(Server *serv, DataHead *info) {
-    String *worker_buffer = serv->get_worker_input_buffer(info->reactor_id);
-
-    if (worker_buffer == nullptr) {
-        worker_buffer = new String(info->len);
-        Server_worker_set_buffer(serv, info, worker_buffer);
-    }
-
-    return worker_buffer->str + worker_buffer->length;
-}
-
-static size_t Server_worker_get_buffer_len(Server *serv, DataHead *info) {
-    String *worker_buffer = serv->get_worker_input_buffer(info->reactor_id);
-
-    return worker_buffer == nullptr ? 0 : worker_buffer->length;
-}
-
-static void Server_worker_add_buffer_len(Server *serv, DataHead *info, size_t len) {
-    String *worker_buffer = serv->get_worker_input_buffer(info->reactor_id);
-    worker_buffer->length += len;
-}
-
-static void Server_worker_move_buffer(Server *serv, PipeBuffer *buffer) {
-    String *worker_buffer = serv->get_worker_input_buffer(buffer->info.reactor_id);
-    memcpy(buffer->data, &worker_buffer, sizeof(worker_buffer));
-    Server_worker_set_buffer(serv, &buffer->info, nullptr);
-}
-
-static size_t Server_worker_get_packet(Server *serv, EventData *req, char **data_ptr) {
+size_t Server::get_packet(EventData *req, char **data_ptr) {
     size_t length;
     if (req->info.flags & SW_EVENT_DATA_PTR) {
         PacketPtr *task = (PacketPtr *) req;
@@ -1413,6 +1371,23 @@ void Server::check_port_type(ListenPort *ls) {
     } else {
         have_stream_sock = 1;
     }
+}
+
+bool Server::is_healthy_connection(double now, Connection *conn) {
+    if (conn->protect || conn->last_recv_time == 0) {
+        return true;
+    }
+    auto lp = get_port_by_session_id(conn->session_id);
+    if (!lp) {
+        return true;
+    }
+    if (lp->heartbeat_idle_time == 0) {
+        return true;
+    }
+    if (conn->last_recv_time > now - lp->heartbeat_idle_time) {
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -1696,6 +1671,7 @@ _find_available_slot:
     connection->server_fd = (sw_atomic_t) server_fd;
     connection->last_recv_time = connection->connect_time = microtime();
     connection->active = 1;
+    connection->worker_id = -1;
     connection->socket_type = ls->type;
     connection->socket = _socket;
 

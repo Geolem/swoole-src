@@ -301,6 +301,11 @@ enum sw_mysql_server_status_flags
                 sw_mysql_int4store((T),def_temp); \
                 sw_mysql_int4store((T+4),def_temp2); } while (0)
 
+#define sw_mysql_doublestore(T,A) do { \
+                double def_temp = (double) A; \
+                memcpy(T, &def_temp, sizeof(double)); \
+                } while (0)
+
 #if defined(SW_DEBUG) && defined(SW_LOG_TRACE_OPEN)
 #define swMysqlPacketDump(length, number, data, title) \
     if (SW_LOG_TRACE >= sw_logger()->get_level() && (SW_TRACE_MYSQL_CLIENT & SwooleG.trace_flags)) \
@@ -684,7 +689,7 @@ public:
     {
         swMysqlPacketDump(header.length, header.number, data, "Protocol::LengthCodedBinary");
         bytes_length = read_lcb(data + SW_MYSQL_PACKET_HEADER_SIZE, &length, &nul);
-        swTraceLog(SW_TRACE_MYSQL_CLIENT, "binary_length=%" PRIu64 ", nul=%u", header.length, nul);
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "binary_length=%u, nul=%u", header.length, nul);
     }
     bool is_vaild()
     {
@@ -796,7 +801,7 @@ public:
         swTraceLog(
             SW_TRACE_MYSQL_CLIENT,
             "text[%" PRIu64 "]: %.*s%s",
-            length, SW_MIN(64, length), body,
+            length, (int) SW_MIN(64, length), body,
             nul ? "null" : ((length > 64 /*|| length > readable_length*/) ? "..." : "")
         );
     }

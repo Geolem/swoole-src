@@ -1,11 +1,13 @@
 --TEST--
-curl_multi_close closed by cleanup functions
+swoole_curl/multi: curl_multi_close closed by cleanup functions
 --SKIPIF--
+<?php require __DIR__ . '/../../include/skipif.inc'; ?>
 <?php
 if (!extension_loaded('curl')) print 'skip';
 ?>
 --FILE--
 <?php
+require __DIR__ . '/../../include/bootstrap.php';
 use Swoole\Runtime;
 
 use function Swoole\Coroutine\run;

@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include "swoole.h"
-
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -31,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "swoole.h"
 #include "swoole_ssl.h"
 #include "swoole_buffer.h"
 #include "swoole_file.h"
@@ -420,6 +419,14 @@ struct Socket {
         return true;
     }
 
+    bool isset_readable_event() {
+        return events & SW_EVENT_READ;
+    }
+
+    bool isset_writable_event() {
+        return events & SW_EVENT_WRITE;
+    }
+
     int wait_event(int timeout_ms, int events);
     void free();
 
@@ -488,6 +495,8 @@ struct Socket {
             abort();
             return SW_ERROR;
         case EBADF:
+        case ENOENT:
+            return SW_INVALID;
         case ECONNRESET:
         case ECONNABORTED:
         case EPIPE:

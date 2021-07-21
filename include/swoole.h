@@ -17,9 +17,9 @@
 
 #pragma once
 
-#if defined(HAVE_CONFIG_H) && !defined(COMPILE_DL_SWOOLE)
+#ifdef HAVE_CONFIG_H
 #include "config.h"
-#elif defined(PHP_ATOM_INC) || defined(ZEND_SIGNALS)
+#elif defined(ENABLE_PHP_SWOOLE)
 #include "php_config.h"
 #endif
 
@@ -353,6 +353,7 @@ enum swReturn_code {
     SW_CLOSE    = 3,
     SW_ERROR    = 4,
     SW_READY    = 5,
+    SW_INVALID  = 6,
 };
 
 enum swFd_type {
@@ -379,6 +380,7 @@ enum swFd_type {
      */
     SW_FD_SIGNAL,
     SW_FD_DNS_RESOLVER,
+    SW_FD_CARES,
     /**
      * SW_FD_USER or SW_FD_USER+n: for custom event
      */
@@ -453,9 +455,10 @@ enum swEventData_flag {
     SW_EVENT_DATA_NORMAL,
     SW_EVENT_DATA_PTR     = 1u << 1,
     SW_EVENT_DATA_CHUNK   = 1u << 2,
-    SW_EVENT_DATA_END     = 1u << 3,
-    SW_EVENT_DATA_OBJ_PTR = 1u << 4,
-    SW_EVENT_DATA_POP_PTR = 1u << 5,
+    SW_EVENT_DATA_BEGIN   = 1u << 3,
+    SW_EVENT_DATA_END     = 1u << 4,
+    SW_EVENT_DATA_OBJ_PTR = 1u << 5,
+    SW_EVENT_DATA_POP_PTR = 1u << 6,
 };
 
 #define swTask_type(task) ((task)->info.server_fd)
@@ -575,6 +578,7 @@ typedef uint8_t ReactorId;
 
 struct DataHead {
     SessionId fd;
+    uint64_t msg_id;
     uint32_t len;
     int16_t reactor_id;
     uint8_t type;
@@ -630,7 +634,7 @@ struct Global {
     int signal_fd;
     bool signal_alarm;
 
-    uint32_t trace_flags;
+    long trace_flags;
 
     void (*fatal_error)(int code, const char *str, ...);
 
@@ -644,18 +648,20 @@ struct Global {
     Allocator std_allocator;
     std::string task_tmpfile;
     //-----------------------[DNS]--------------------------
-    char *dns_server_v4;
-    char *dns_server_v6;
+    std::string dns_server_host;
+    int dns_server_port;
     double dns_cache_refresh_time;
+    int dns_tries;
+    std::string dns_resolvconf_path;
     //-----------------------[AIO]--------------------------
     uint32_t aio_core_worker_num;
     uint32_t aio_worker_num;
     double aio_max_wait_time;
     double aio_max_idle_time;
-    swoole::network::Socket *aio_default_socket;
+    network::Socket *aio_default_socket;
     //-----------------------[Hook]--------------------------
     void *hooks[SW_MAX_HOOK_TYPE];
-    std::function<bool(swoole::Reactor *reactor, int &event_num)> user_exit_condition;
+    std::function<bool(Reactor *reactor, int &event_num)> user_exit_condition;
 };
 
 std::string dirname(const std::string &file);
@@ -691,6 +697,11 @@ static inline int swoole_get_process_id() {
 
 SW_API const char *swoole_strerror(int code);
 SW_API void swoole_throw_error(int code);
+SW_API void swoole_set_log_level(int level);
+SW_API void swoole_set_trace_flags(int flags);
+SW_API void swoole_set_dns_server(const std::string server);
+SW_API std::pair<std::string, int> swoole_get_dns_server();
+SW_API bool swoole_load_resolv_conf();
 
 //-----------------------------------------------
 static sw_inline void sw_spinlock(sw_atomic_t *lock) {

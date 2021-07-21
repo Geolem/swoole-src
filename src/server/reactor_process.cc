@@ -77,7 +77,8 @@ int Server::start_reactor_processes() {
     }
 
     ProcessPool *pool = &gs->event_workers;
-    if (ProcessPool::create(pool, worker_num, 0, SW_IPC_UNIXSOCK) < 0) {
+    *pool = {};
+    if (pool->create(worker_num, 0, SW_IPC_UNIXSOCK) < 0) {
         return SW_ERR;
     }
     pool->set_max_request(max_request, max_request_grace);
@@ -436,16 +437,10 @@ static void ReactorProcess_onTimeout(Timer *timer, TimerNode *tnode) {
     Event notify_ev{};
     double now = microtime();
 
-    if (now < serv->heartbeat_check_lasttime + 10) {
-        return;
-    }
-
     notify_ev.type = SW_FD_SESSION;
 
-    int checktime = now - serv->heartbeat_idle_time;
-
-    serv->foreach_connection([serv, checktime, reactor, &notify_ev](Connection *conn) {
-        if (conn->protect || conn->last_recv_time > checktime) {
+    serv->foreach_connection([serv, reactor, now, &notify_ev](Connection *conn) {
+        if (serv->is_healthy_connection(now, conn)) {
             return;
         }
 #ifdef SW_USE_OPENSSL

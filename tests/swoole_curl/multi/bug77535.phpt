@@ -1,6 +1,7 @@
 --TEST--
-Bug #77535 (Invalid callback, h2 server push)
+swoole_curl/multi: Bug #77535 (Invalid callback, h2 server push)
 --SKIPIF--
+<?php require __DIR__ . '/../../include/skipif.inc'; ?>
 <?php
 if (getenv("SKIP_ONLINE_TESTS")) {
     die("skip online test");
@@ -12,6 +13,7 @@ if ($curl_version['version_number'] < 0x073d00) {
 ?>
 --FILE--
 <?php
+require __DIR__ . '/../../include/bootstrap.php';
 class MyHttpClient
 {
     private $mh;
@@ -90,5 +92,3 @@ MyHttpClient::addServerPushCallback
 MyHttpClient::sendRequest[2]
 MyHttpClient::sendRequest[3]
 Start handle request.
-
-

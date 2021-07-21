@@ -49,6 +49,7 @@ class Client {
     bool remove_delay = false;
     bool closed = false;
     bool high_watermark = false;
+    bool async_connect = false;
 
     /**
      * one package: length check
@@ -126,6 +127,10 @@ class Client {
         http_proxy->proxy_port = port;
     }
 
+    Socket *get_socket() {
+        return socket;
+    }
+
     int sleep();
     int wakeup();
     int shutdown(int __how);
@@ -169,7 +174,7 @@ class Stream {
         }
     }
     ~Stream();
-    static int recv_blocking(Socket *sock, void *__buf, size_t __len);
+    static ssize_t recv_blocking(Socket *sock, void *__buf, size_t __len);
     static void set_protocol(Protocol *protocol);
 
   private:

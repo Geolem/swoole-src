@@ -645,12 +645,12 @@ PHP_METHOD(swoole_coroutine_system, waitSignal) {
     ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
 
     if (!System::wait_signal(signo, timeout)) {
-        if (errno == EBUSY) {
+        if (swoole_get_last_error() == EBUSY) {
             php_swoole_fatal_error(E_WARNING, "Unable to wait signal, async signal listener has been registered");
-        } else if (errno == EINVAL) {
+        } else if (swoole_get_last_error() == EINVAL) {
             php_swoole_fatal_error(E_WARNING, "Invalid signal [" ZEND_LONG_FMT "]", signo);
         }
-        swoole_set_last_error(errno);
+        errno = swoole_get_last_error();
         RETURN_FALSE;
     }
 
@@ -671,11 +671,14 @@ PHP_METHOD(swoole_coroutine_system, waitEvent) {
 
     int fd = php_swoole_convert_to_fd(zfd);
     if (fd < 0) {
-        php_swoole_fatal_error(E_WARNING, "unknow fd type");
+        php_swoole_fatal_error(E_WARNING, "unknown fd type");
         RETURN_FALSE;
     }
 
     events = System::wait_event(fd, events, timeout);
+    if (events < 0) {
+        RETURN_FALSE;
+    }
 
     RETURN_LONG(events);
 }

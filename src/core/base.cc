@@ -22,23 +22,15 @@
 
 #include <sys/stat.h>
 #include <sys/resource.h>
-#include <sys/ioctl.h>
-
-#ifdef HAVE_EXECINFO
-#include <execinfo.h>
-#endif
 
 #ifdef __MACH__
 #include <sys/syslimits.h>
 #endif
 
-#include <regex>
 #include <algorithm>
 #include <list>
 #include <set>
 #include <unordered_map>
-#include <thread>
-#include <sstream>
 
 #include "swoole_api.h"
 #include "swoole_string.h"
@@ -132,6 +124,10 @@ void swoole_init(void) {
     SwooleG.fatal_error = swoole_fatal_error;
     SwooleG.cpu_num = SW_MAX(1, sysconf(_SC_NPROCESSORS_ONLN));
     SwooleG.pagesize = getpagesize();
+
+    // DNS options
+    SwooleG.dns_tries = 1;
+    SwooleG.dns_resolvconf_path = SW_DNS_RESOLV_CONF;
 
     // get system uname
     uname(&SwooleG.uname);
@@ -233,7 +229,49 @@ void swoole_clean(void) {
         delete g_logger_instance;
         g_logger_instance = nullptr;
     }
+    if (SwooleTG.buffer_stack) {
+        delete SwooleTG.buffer_stack;
+        SwooleTG.buffer_stack = nullptr;
+    }
     SwooleG = {};
+}
+
+SW_API void swoole_set_log_level(int level) {
+    if (sw_logger()) {
+        sw_logger()->set_level(level);
+    }
+}
+
+SW_API void swoole_set_trace_flags(int flags) {
+    SwooleG.trace_flags = flags;
+}
+
+SW_API void swoole_set_dns_server(const std::string server) {
+    char *_port;
+    int dns_server_port = SW_DNS_SERVER_PORT;
+    char dns_server_host[32];
+    strcpy(dns_server_host, server.c_str());
+    if ((_port = strchr((char *)server.c_str(), ':'))) {
+        dns_server_port = atoi(_port + 1);
+        if (dns_server_port <= 0 || dns_server_port > 65535) {
+            dns_server_port = SW_DNS_SERVER_PORT;
+        }
+        dns_server_host[_port - server.c_str()] = '\0';
+    }
+    SwooleG.dns_server_host = dns_server_host;
+    SwooleG.dns_server_port = dns_server_port;
+}
+
+SW_API std::pair<std::string, int> swoole_get_dns_server() {
+    std::pair<std::string, int> result;
+    if (SwooleG.dns_server_host.empty()) {
+        result.first = "";
+        result.second = 0;
+    } else {
+        result.first = SwooleG.dns_server_host;
+        result.second = SwooleG.dns_server_port;
+    }
+    return result;
 }
 
 bool swoole_set_task_tmpdir(const std::string &dir) {
@@ -264,7 +302,7 @@ pid_t swoole_fork(int flags) {
             swFatalError(SW_ERROR_OPERATION_NOT_SUPPORT, "must be forked outside the coroutine");
         }
         if (SwooleTG.async_threads) {
-            swTrace("aio_task_num=%d, reactor=%p", SwooleTG.async_threads->task_num, SwooleTG.reactor);
+            swTrace("aio_task_num=%d, reactor=%p", SwooleTG.async_threads->task_num, sw_reactor());
             swFatalError(SW_ERROR_OPERATION_NOT_SUPPORT, "can not create server after using async file operation");
         }
     }
@@ -748,6 +786,7 @@ void swoole_print_backtrace(void) {
     std::cout << boost::stacktrace::stacktrace();
 }
 #elif defined(HAVE_EXECINFO)
+#include <execinfo.h>
 void swoole_print_backtrace(void) {
     int size = 16;
     void *array[16];
@@ -778,7 +817,9 @@ static void swoole_fatal_error(int code, const char *format, ...) {
     exit(1);
 }
 
-size_t swDataHead::dump(char *_buf, size_t _len) {
+namespace swoole {
+//-------------------------------------------------------------------------------
+size_t DataHead::dump(char *_buf, size_t _len) {
     return sw_snprintf(_buf,
                        _len,
                        "swDataHead[%p]\n"
@@ -799,8 +840,6 @@ size_t swDataHead::dump(char *_buf, size_t _len) {
                        server_fd);
 }
 
-namespace swoole {
-//-------------------------------------------------------------------------------
 std::string dirname(const std::string &file) {
     size_t index = file.find_last_of('/');
     if (index == std::string::npos) {

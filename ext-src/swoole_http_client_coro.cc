@@ -21,6 +21,7 @@
 #include "php_swoole_http.h"
 
 #include "swoole_string.h"
+#include "swoole_protocol.h"
 #include "swoole_file.h"
 #include "swoole_util.h"
 #include "swoole_websocket.h"
@@ -32,8 +33,6 @@ SW_EXTERN_C_BEGIN
 
 #include "thirdparty/swoole_http_parser.h"
 
-#include "ext/standard/basic_functions.h"
-#include "ext/standard/php_http.h"
 #include "ext/standard/base64.h"
 
 #ifdef SW_HAVE_ZLIB
@@ -50,6 +49,8 @@ using swoole::File;
 using swoole::String;
 using swoole::coroutine::Socket;
 using swoole::network::Address;
+
+namespace WebSocket = swoole::websocket;
 
 enum http_client_error_status_code {
     HTTP_CLIENT_ESTATUS_CONNECT_FAILED = -1,
@@ -116,6 +117,8 @@ class HttpClient {
     bool websocket = false;      // if upgrade successfully
     bool chunked = false;        // Transfer-Encoding: chunked
     bool websocket_mask = true;  // enable websocket mask
+    bool body_decompression = true;
+    bool http_compression = true;
 #ifdef SW_HAVE_ZLIB
     bool websocket_compression = false;  // allow to compress websocket messages
 #endif
@@ -180,7 +183,7 @@ class HttpClient {
     void recv(zval *zframe, double timeout = 0);
     bool recv_http_response(double timeout = 0);
     bool upgrade(std::string path);
-    bool push(zval *zdata, zend_long opcode = WEBSOCKET_OPCODE_TEXT, uint8_t flags = SW_WEBSOCKET_FLAG_FIN);
+    bool push(zval *zdata, zend_long opcode = websocket::OPCODE_TEXT, uint8_t flags = websocket::FLAG_FIN);
     bool close(const bool should_be_reset = true);
 
     void get_header_out(zval *return_value) {
@@ -540,7 +543,7 @@ static int http_parser_on_headers_complete(swoole_http_parser *parser) {
 static int http_parser_on_body(swoole_http_parser *parser, const char *at, size_t length) {
     HttpClient *http = (HttpClient *) parser->data;
 #ifdef SW_HAVE_COMPRESSION
-    if (!http->compression_error && http->compress_method != HTTP_COMPRESS_NONE) {
+    if (http->body_decompression && !http->compression_error && http->compress_method != HTTP_COMPRESS_NONE) {
         if (!http->decompress_response(at, length)) {
             http->compression_error = true;
             goto _append_raw;
@@ -772,6 +775,12 @@ void HttpClient::apply_setting(zval *zset, const bool check_all) {
         }
         if (php_swoole_array_get_value(vht, "websocket_mask", ztmp)) {
             websocket_mask = zval_is_true(ztmp);
+        }
+        if (php_swoole_array_get_value(vht, "http_compression", ztmp)) {
+            http_compression = zval_is_true(ztmp);
+        }
+        if (php_swoole_array_get_value(vht, "body_decompression", ztmp)) {
+            body_decompression = zval_is_true(ztmp);
         }
 #ifdef SW_HAVE_ZLIB
         if (php_swoole_array_get_value(vht, "websocket_compression", ztmp)) {
@@ -1059,7 +1068,7 @@ bool HttpClient::send() {
         }
     }
 #ifdef SW_HAVE_COMPRESSION
-    if (!(header_flag & HTTP_HEADER_ACCEPT_ENCODING)) {
+    if (http_compression && !(header_flag & HTTP_HEADER_ACCEPT_ENCODING)) {
         add_headers(buffer,
                     ZEND_STRL("Accept-Encoding"),
 #if defined(SW_HAVE_ZLIB) && defined(SW_HAVE_BROTLI)
@@ -1392,7 +1401,7 @@ bool HttpClient::recv(double timeout) {
         socket->protocol.package_length_size = SW_WEBSOCKET_HEADER_LEN;
         socket->protocol.package_length_offset = 0;
         socket->protocol.package_body_offset = 0;
-        socket->protocol.get_package_length = swWebSocket_get_package_length;
+        socket->protocol.get_package_length = websocket::get_package_length;
     }
     // handler keep alive
     if (!keep_alive && !websocket) {
@@ -1434,7 +1443,7 @@ void HttpClient::recv(zval *zframe, double timeout) {
             close();
         }
     } else {
-        swString msg;
+        String msg;
         msg.length = retval;
         msg.str = socket->get_read_buffer()->str;
 #ifdef SW_HAVE_ZLIB
@@ -2094,9 +2103,9 @@ static PHP_METHOD(swoole_http_client_coro, upgrade) {
 static PHP_METHOD(swoole_http_client_coro, push) {
     HttpClient *phc = php_swoole_get_phc(ZEND_THIS);
     zval *zdata;
-    zend_long opcode = WEBSOCKET_OPCODE_TEXT;
+    zend_long opcode = WebSocket::OPCODE_TEXT;
     zval *zflags = nullptr;
-    zend_long flags = SW_WEBSOCKET_FLAG_FIN;
+    zend_long flags = WebSocket::FLAG_FIN;
 
     ZEND_PARSE_PARAMETERS_START(1, 3)
     Z_PARAM_ZVAL(zdata)
@@ -2109,7 +2118,7 @@ static PHP_METHOD(swoole_http_client_coro, push) {
         flags = zval_get_long(zflags);
     }
 
-    RETURN_BOOL(phc->push(zdata, opcode, flags & SW_WEBSOCKET_FLAGS_ALL));
+    RETURN_BOOL(phc->push(zdata, opcode, flags & WebSocket::FLAGS_ALL));
 }
 
 static PHP_METHOD(swoole_http_client_coro, recv) {

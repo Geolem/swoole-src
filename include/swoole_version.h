@@ -19,12 +19,12 @@
 #define SWOOLE_VERSION_H_
 
 #define SWOOLE_MAJOR_VERSION 4
-#define SWOOLE_MINOR_VERSION 6
-#define SWOOLE_RELEASE_VERSION 5
-#define SWOOLE_EXTRA_VERSION "dev"
-#define SWOOLE_VERSION "4.6.5-dev"
-#define SWOOLE_VERSION_ID 40605
-#define SWOOLE_API_VERSION_ID 0x202012a
+#define SWOOLE_MINOR_VERSION 7
+#define SWOOLE_RELEASE_VERSION 0
+#define SWOOLE_EXTRA_VERSION ""
+#define SWOOLE_VERSION "4.7.0"
+#define SWOOLE_VERSION_ID 40700
+#define SWOOLE_API_VERSION_ID 0x202107a
 
 #define SWOOLE_BUG_REPORT                                                                                              \
     "A bug occurred in Swoole-v" SWOOLE_VERSION ", please report it.\n"                                                \

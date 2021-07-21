@@ -39,6 +39,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -60,6 +61,8 @@ enum swFactory_dispatch_mode {
     SW_DISPATCH_UIDMOD = 5,
     SW_DISPATCH_USERFUNC = 6,
     SW_DISPATCH_STREAM = 7,
+    SW_DISPATCH_CO_CONN_LB,
+    SW_DISPATCH_CO_REQ_LB,
 };
 
 enum swFactory_dispatch_result {
@@ -97,6 +100,7 @@ struct Connection {
     uint8_t active;
     enum swSocket_type socket_type;
     int fd;
+    int worker_id;
     SessionId session_id;
     //--------------------------------------------------------------
 #ifdef SW_USE_OPENSSL
@@ -253,6 +257,8 @@ struct ListenPort {
     int port = 0;
     network::Socket *socket = nullptr;
     pthread_t thread_id = 0;
+
+    uint16_t heartbeat_idle_time = 0;
 
     /**
      * check data eof
@@ -551,7 +557,6 @@ class Server {
 
     int worker_uid = 0;
     int worker_groupid = 0;
-    void **worker_input_buffers = nullptr;
 
     /**
      * worker process max request
@@ -567,6 +572,9 @@ class Server {
     uint32_t max_wait_time = SW_WORKER_MAX_WAIT_TIME;
 
     /*----------------------------Reactor schedule--------------------------------*/
+    const Allocator *worker_buffer_allocator;
+    std::unordered_map<uint64_t, std::shared_ptr<String>> worker_buffers;
+    std::atomic<uint64_t> worker_msg_id;
     sw_atomic_t worker_round_id = 0;
 
     /**
@@ -679,9 +687,7 @@ class Server {
     PipeBuffer **pipe_buffers = nullptr;
     double send_timeout = 0;
 
-    uint16_t heartbeat_idle_time = 0;
     uint16_t heartbeat_check_interval = 0;
-    uint32_t heartbeat_check_lasttime = 0;
 
     time_t reload_time = 0;
     time_t warning_time = 0;
@@ -690,7 +696,7 @@ class Server {
     TimerNode *heartbeat_timer = nullptr;
 
     /* buffer output/input setting*/
-    uint32_t output_buffer_size = SW_OUTPUT_BUFFER_SIZE;
+    uint32_t output_buffer_size = UINT_MAX;
     uint32_t input_buffer_size = SW_INPUT_BUFFER_SIZE;
     uint32_t max_queued_bytes = 0;
 
@@ -848,13 +854,29 @@ class Server {
     /**
      * Chunk control
      */
-    void **(*create_buffers)(Server *serv, uint32_t buffer_num) = nullptr;
-    void (*free_buffers)(Server *serv, uint32_t buffer_num, void **buffers) = nullptr;
-    void *(*get_buffer)(Server *serv, DataHead *info) = nullptr;
-    size_t (*get_buffer_len)(Server *serv, DataHead *info) = nullptr;
-    void (*add_buffer_len)(Server *serv, DataHead *info, size_t len) = nullptr;
-    void (*move_buffer)(Server *serv, PipeBuffer *buffer) = nullptr;
-    size_t (*get_packet)(Server *serv, EventData *req, char **data_ptr) = nullptr;
+    size_t get_packet(EventData *req, char **data_ptr);
+
+    String *get_worker_buffer(DataHead *info) {
+        auto iter = worker_buffers.find(info->msg_id);
+        if (iter == worker_buffers.end()) {
+            if (info->flags & SW_EVENT_DATA_BEGIN) {
+                auto buffer = make_string(info->len, worker_buffer_allocator);
+                worker_buffers.emplace(info->msg_id, std::shared_ptr<String>(buffer));
+                return buffer;
+            }
+            return nullptr;
+        }
+        return iter->second.get();
+    }
+
+    void pop_worker_buffer(DataHead *info) {
+        uint64_t msg_id = info->msg_id;
+        auto iter = worker_buffers.find(msg_id);
+        if (iter != worker_buffers.end()) {
+            iter->second.get()->str = nullptr;
+        }
+    }
+
     /**
      * Hook
      */
@@ -979,7 +1001,8 @@ class Server {
     }
 
     inline bool is_hash_dispatch_mode() {
-        return dispatch_mode == SW_DISPATCH_FDMOD || dispatch_mode == SW_DISPATCH_IPMOD;
+        return dispatch_mode == SW_DISPATCH_FDMOD || dispatch_mode == SW_DISPATCH_IPMOD ||
+               dispatch_mode == SW_DISPATCH_CO_CONN_LB;
     }
 
     inline bool is_support_send_yield() {
@@ -1023,6 +1046,19 @@ class Server {
         return nullptr;
     }
 
+    int get_lowest_load_worker_id() {
+        uint32_t lowest_load_worker_id = 0;
+        size_t min_coroutine = workers[0].coroutine_num;
+        for (uint32_t i = 1; i < worker_num; i++) {
+            if (workers[i].coroutine_num < min_coroutine) {
+                min_coroutine = workers[i].coroutine_num;
+                lowest_load_worker_id = i;
+                continue;
+            }
+        }
+        return lowest_load_worker_id;
+    }
+
     void stop_async_worker(Worker *worker);
 
     inline Pipe *get_pipe_object(int pipe_fd) {
@@ -1031,14 +1067,6 @@ class Server {
 
     size_t get_all_worker_num() {
         return worker_num + task_worker_num + user_worker_num;
-    }
-
-    inline String *get_worker_input_buffer(int reactor_id) {
-        if (is_base_mode()) {
-            return (String *) worker_input_buffers[0];
-        } else {
-            return (String *) worker_input_buffers[reactor_id];
-        }
     }
 
     inline ReactorThread *get_thread(int reactor_id) {
@@ -1069,6 +1097,15 @@ class Server {
         return SwooleG.process_type == SW_PROCESS_USERWORKER;
     }
 
+    bool is_sync_process() {
+        if (is_manager()) {
+            return true;
+        }
+        if (is_task_worker() && !task_enable_coroutine) {
+            return true;
+        }
+        return false;
+    }
     inline bool is_shutdown() {
         return gs->shutdown;
     }
@@ -1077,6 +1114,8 @@ class Server {
     inline bool is_valid_connection(Connection *conn) {
         return (conn && conn->socket && conn->active && conn->socket->fd_type == SW_FD_SESSION);
     }
+
+    bool is_healthy_connection(double now, Connection *conn);
 
     static int is_dgram_event(uint8_t type) {
         switch (type) {
@@ -1138,7 +1177,7 @@ class Server {
 
     inline Connection *get_connection_for_iterator(int fd) {
         Connection *conn = get_connection(fd);
-        if (conn && conn->active && !conn->closed && conn->session_id > 0) {
+        if (conn && conn->active && !conn->closed) {
 #ifdef SW_USE_OPENSSL
             if (conn->ssl && !conn->ssl_ready) {
                 return nullptr;

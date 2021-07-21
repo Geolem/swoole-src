@@ -17,10 +17,8 @@
 #include "swoole_server.h"
 #include "swoole_memory.h"
 #include "swoole_hash.h"
-#include "swoole_http.h"
 #include "swoole_client.h"
 #include "swoole_util.h"
-#include "swoole_websocket.h"
 
 #include <assert.h>
 
@@ -418,7 +416,7 @@ static int ReactorThread_onPipeRead(Reactor *reactor, Event *ev) {
                                          SW_ERROR_SESSION_NOT_EXIST,
                                          "force close connection failed, session#%ld does not exist",
                                          session_id);
-                        return SW_ERR;
+                        return SW_OK;
                     }
 
                     if (serv->disable_notify || conn->close_force) {
@@ -650,9 +648,7 @@ static int ReactorThread_onWrite(Reactor *reactor, Event *ev) {
     while (!Buffer::empty(socket->out_buffer)) {
         BufferChunk *chunk = socket->out_buffer->front();
         if (chunk->type == BufferChunk::TYPE_CLOSE) {
-        _close_fd:
-            reactor->close(reactor, socket);
-            return SW_OK;
+            return reactor->close(reactor, socket);
         } else if (chunk->type == BufferChunk::TYPE_SENDFILE) {
             ret = socket->handle_sendfile();
         } else {
@@ -665,7 +661,7 @@ static int ReactorThread_onWrite(Reactor *reactor, Event *ev) {
         if (ret < 0) {
             if (socket->close_wait) {
                 conn->close_errno = errno;
-                goto _close_fd;
+                return reactor->trigger_close_event(ev);
             } else if (socket->send_wait) {
                 break;
             }
@@ -784,8 +780,7 @@ _init_master_thread:
     /**
      * heartbeat thread
      */
-    if (heartbeat_check_interval >= 1 && heartbeat_check_interval <= heartbeat_idle_time) {
-        swTrace("hb timer start, time: %d live time:%d", heartbeat_check_interval, heartbeat_idle_time);
+    if (heartbeat_check_interval >= 1) {
         start_heartbeat_thread();
     }
 
@@ -1090,16 +1085,20 @@ void Server::start_heartbeat_thread() {
         SwooleTG.id = reactor_num;
 
         while (running) {
-            double checktime = microtime() - heartbeat_idle_time;
-            foreach_connection([this, checktime](Connection *conn) {
-                if (conn->protect || conn->last_recv_time == 0 || conn->last_recv_time > checktime) {
+            double now = microtime();
+            foreach_connection([this, now](Connection *conn) {
+                SessionId session_id = conn->session_id;
+                if (session_id <= 0) {
+                    return;
+                }
+                if (is_healthy_connection(now, conn)) {
                     return;
                 }
                 DataHead ev{};
                 ev.type = SW_SERVER_EVENT_CLOSE_FORCE;
                 // convert fd to session_id, in order to verify the connection before the force close connection
-                ev.fd = conn->session_id;
-                Socket *_pipe_sock = get_reactor_thread_pipe(conn->session_id, conn->reactor_id);
+                ev.fd = session_id;
+                Socket *_pipe_sock = get_reactor_thread_pipe(session_id, conn->reactor_id);
                 _pipe_sock->send_blocking((void *) &ev, sizeof(ev));
             });
             sleep(heartbeat_check_interval);

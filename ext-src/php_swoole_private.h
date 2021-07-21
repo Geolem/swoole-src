@@ -14,30 +14,15 @@
   +----------------------------------------------------------------------+
 */
 
-#ifndef PHP_SWOOLE_H
-#define PHP_SWOOLE_H
+#ifndef PHP_SWOOLE_PRIVATE_H
+#define PHP_SWOOLE_PRIVATE_H
 
 // C++ build format macros must defined earlier
 #ifdef __cplusplus
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include "php.h"
-#include "php_ini.h"
-#include "php_globals.h"
-#include "php_main.h"
-
-#include "php_streams.h"
-#include "php_network.h"
-
-#include "zend_variables.h"
-#include "zend_interfaces.h"
-#include "zend_closures.h"
-#include "zend_exceptions.h"
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#include "php_swoole.h"
 
 #define SW_HAVE_COUNTABLE 1
 
@@ -62,8 +47,6 @@ BEGIN_EXTERN_C()
 
 extern PHPAPI int php_array_merge(zend_array *dest, zend_array *src);
 
-extern zend_module_entry swoole_module_entry;
-
 #ifdef PHP_WIN32
 #define PHP_SWOOLE_API __declspec(dllexport)
 #elif defined(__GNUC__) && __GNUC__ >= 4
@@ -78,11 +61,12 @@ extern zend_module_entry swoole_module_entry;
     } else {                                                                                                           \
         RETURN_TRUE;                                                                                                   \
     }
-#define SW_LOCK_CHECK_RETURN(s)                                                                                        \
-    if (s == 0) {                                                                                                      \
+#define SW_LOCK_CHECK_RETURN(s)																						   \
+    zend_long ___tmp_return_value = s; 																				   \
+    if (___tmp_return_value == 0) {                                                                                    \
         RETURN_TRUE;                                                                                                   \
     } else {                                                                                                           \
-        zend_update_property_long(NULL, SW_Z8_OBJ_P(ZEND_THIS), SW_STRL("errCode"), s);                                \
+        zend_update_property_long(NULL, SW_Z8_OBJ_P(ZEND_THIS), SW_STRL("errCode"), ___tmp_return_value );             \
         RETURN_FALSE;                                                                                                  \
     }
 
@@ -98,6 +82,12 @@ extern zend_module_entry swoole_module_entry;
 #ifdef SW_USE_OPENSSL
 #ifndef HAVE_OPENSSL
 #error "Enable openssl support, require openssl library"
+#endif
+#endif
+
+#ifdef SW_USE_CARES
+#ifndef HAVE_CARES
+#error "Enable c-ares support, require c-ares library"
 #endif
 #endif
 
@@ -152,13 +142,13 @@ enum php_swoole_fd_type {
     PHP_SWOOLE_FD_CO_CURL,
 };
 //---------------------------------------------------------
-typedef enum {
+enum php_swoole_req_status {
     PHP_SWOOLE_RINIT_BEGIN,
     PHP_SWOOLE_RINIT_END,
     PHP_SWOOLE_CALL_USER_SHUTDOWNFUNC_BEGIN,
     PHP_SWOOLE_RSHUTDOWN_BEGIN,
     PHP_SWOOLE_RSHUTDOWN_END,
-} php_swoole_req_status;
+};
 //---------------------------------------------------------
 
 static sw_inline enum swSocket_type php_swoole_socktype(long type) {
@@ -183,12 +173,6 @@ extern zend_class_entry *swoole_server_port_ce;
 extern zend_class_entry *swoole_exception_ce;
 extern zend_object_handlers swoole_exception_handlers;
 extern zend_class_entry *swoole_error_ce;
-
-PHP_MINIT_FUNCTION(swoole);
-PHP_MSHUTDOWN_FUNCTION(swoole);
-PHP_RINIT_FUNCTION(swoole);
-PHP_RSHUTDOWN_FUNCTION(swoole);
-PHP_MINFO_FUNCTION(swoole);
 
 PHP_FUNCTION(swoole_clear_dns_cache);
 PHP_FUNCTION(swoole_last_error);
@@ -312,27 +296,6 @@ php_socket *php_swoole_convert_to_socket(int sock);
 #endif
 
 zend_bool php_swoole_signal_isset_handler(int signo);
-
-// clang-format off
-ZEND_BEGIN_MODULE_GLOBALS(swoole)
-    zend_bool display_errors;
-    zend_bool cli;
-    zend_bool use_shortname;
-    zend_bool enable_coroutine;
-    zend_bool enable_preemptive_scheduler;
-    zend_bool enable_library;
-    long socket_buffer_size;
-    php_swoole_req_status req_status;
-ZEND_END_MODULE_GLOBALS(swoole)
-// clang-format on
-
-extern ZEND_DECLARE_MODULE_GLOBALS(swoole);
-
-#ifdef ZTS
-#define SWOOLE_G(v) TSRMG(swoole_globals_id, zend_swoole_globals *, v)
-#else
-#define SWOOLE_G(v) (swoole_globals.v)
-#endif
 
 /* PHP 7 compatibility patches */
 #define sw_zend_bailout() zend_bailout()
@@ -521,17 +484,6 @@ static sw_inline zend_bool ZVAL_IS_OBJECT(zval *v) {
 
 static sw_inline zval *sw_malloc_zval() {
     return (zval *) emalloc(sizeof(zval));
-}
-
-static sw_inline zend_string *sw_get_zend_string(void *addr) {
-    return (zend_string *) ((char *) addr - offsetof(zend_string, val));
-}
-
-static sw_inline void sw_set_zend_string(zval *zdata, char *addr, size_t length) {
-    zend_string *zstr = sw_get_zend_string(addr);
-    addr[length] = 0;
-    zstr->len = length;
-    ZVAL_STR(zdata, zstr);
 }
 
 static sw_inline zval *sw_zval_dup(zval *val) {
@@ -1126,4 +1078,4 @@ static sw_inline char *php_swoole_http_build_query(zval *zdata, size_t *length, 
 
 END_EXTERN_C()
 
-#endif /* PHP_SWOOLE_H */
+#endif /* PHP_SWOOLE_PRIVATE_H */

@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include "swoole.h"
 #include "swoole_api.h"
+#include "swoole_socket.h"
 #include "swoole_coroutine.h"
 #include "swoole_protocol.h"
 #include "swoole_proxy.h"
@@ -589,7 +591,11 @@ class ProtocolSwitch {
     }
 };
 
-std::vector<std::string> dns_lookup(const char *domain, double timeout = 2.0);
+std::vector<std::string> dns_lookup(const char *domain, int family = AF_INET, double timeout = 2.0);
+std::vector<std::string> dns_lookup_impl_with_socket(const char *domain, int family, double timeout);
+#ifdef SW_USE_CARES
+std::vector<std::string> dns_lookup_impl_with_cares(const char *domain, int family, double timeout);
+#endif
 //-------------------------------------------------------------------------------
 }  // namespace coroutine
 }  // namespace swoole

@@ -17,16 +17,14 @@
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_coroutine_socket.h"
-
-#include <string>
-#include <iostream>
-
+#include "swoole_string.h"
 #include "swoole_util.h"
-#include "swoole_socket.h"
-#include "swoole_coroutine_system.h"
+#include "swoole_reactor.h"
 #include "swoole_buffer.h"
 #include "swoole_base64.h"
+
+#include "swoole_coroutine_socket.h"
+#include "swoole_coroutine_system.h"
 
 namespace swoole {
 namespace coroutine {
@@ -155,9 +153,14 @@ bool Socket::wait_event(const enum swEvent_type event, const void **__buf, size_
                                      : socket->ssl_want_write ? "SSL WRITE" :
 #endif
                                                               event == SW_EVENT_READ ? "READ" : "WRITE");
+
+    Coroutine::CancelFunc cancel_fn = [this, event](Coroutine *co){
+        return cancel(event);
+    };
+
     if (sw_likely(event == SW_EVENT_READ)) {
         read_co = co;
-        read_co->yield();
+        read_co->yield(&cancel_fn);
         read_co = nullptr;
     } else if (event == SW_EVENT_WRITE) {
         if (sw_unlikely(!zero_copy && __n > 0 && *__buf != get_write_buffer()->str)) {
@@ -169,7 +172,7 @@ bool Socket::wait_event(const enum swEvent_type event, const void **__buf, size_
             *__buf = write_buffer->str;
         }
         write_co = co;
-        write_co->yield();
+        write_co->yield(&cancel_fn);
         write_co = nullptr;
     } else {
         assert(0);
@@ -703,7 +706,7 @@ bool Socket::connect(std::string _host, int _port, int flags) {
             _target_addr = (struct sockaddr *) &socket->info.addr.un;
             break;
         } else {
-            set_err(EINVAL, "unknow protocol[%d]");
+            set_err(EINVAL, "unknown protocol[%d]");
             return false;
         }
     }
@@ -1367,7 +1370,7 @@ ssize_t Socket::sendto(const std::string &host, int port, const void *__buf, siz
 
     for (size_t i = 0; i < 2; i++) {
         if (type == SW_SOCK_UDP) {
-            if (::inet_aton(ip.c_str(), &addr.in.sin_addr) == 0) {
+            if (::inet_pton(AF_INET, ip.c_str(), &addr.in.sin_addr) == 0) {
                 read_co = write_co = Coroutine::get_current_safe();
                 ip = System::gethostbyname(host, sock_domain, dns_timeout);
                 read_co = write_co = nullptr;
@@ -1483,7 +1486,13 @@ _get_length:
         goto _recv_header;
     } else if (packet_len > protocol.package_max_length) {
         read_buffer->clear();
-        set_err(SW_ERROR_PACKAGE_LENGTH_TOO_LARGE, "remote packet is too big");
+        swoole_error_log(SW_LOG_WARNING,
+                            SW_ERROR_PACKAGE_LENGTH_TOO_LARGE,
+                            "packet length is too big, remote_addr=%s:%d, length=%zu",
+                            socket->info.get_ip(),
+                            socket->info.get_port(),
+                            packet_len);
+        set_err(SW_ERROR_PACKAGE_LENGTH_TOO_LARGE, sw_error);
         return -1;
     }
 
