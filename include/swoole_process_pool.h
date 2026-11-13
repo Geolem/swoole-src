@@ -10,45 +10,83 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
-
-#include <signal.h>
-#include <unordered_map>
-
+#include "swoole_signal.h"
 #include "swoole_lock.h"
 #include "swoole_pipe.h"
+#include "swoole_channel.h"
 #include "swoole_msg_queue.h"
+#include "swoole_message_bus.h"
 
-enum swWorker_status {
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
+
+#include <csignal>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
+
+enum swWorkerStatus {
     SW_WORKER_BUSY = 1,
     SW_WORKER_IDLE = 2,
     SW_WORKER_EXIT = 3,
 };
 
-enum swIPC_type {
+enum swWorkerType {
+    SW_MASTER = 1,
+    SW_WORKER = 2,
+    SW_MANAGER = 3,
+    SW_EVENT_WORKER = 2,
+    SW_TASK_WORKER = 4,
+    SW_USER_WORKER = 5,
+};
+
+enum swIPCMode {
     SW_IPC_NONE = 0,
+#ifndef _WIN32
     SW_IPC_UNIXSOCK = 1,
     SW_IPC_MSGQUEUE = 2,
+#endif
     SW_IPC_SOCKET = 3,
 };
 
+enum swWorkerMessageType {
+    SW_WORKER_MESSAGE_STOP = 1,
+};
+
+enum swProtocolType {
+    SW_PROTOCOL_TASK = 1,
+    SW_PROTOCOL_STREAM,
+    SW_PROTOCOL_MESSAGE,
+};
+
+SW_API swoole::WorkerId swoole_get_worker_id();
+SW_API pid_t swoole_get_worker_pid();
+SW_API int swoole_get_worker_type();
+SW_API void swoole_set_worker_pid(pid_t pid);
+SW_API void swoole_set_worker_id(swoole::WorkerId worker_id);
+SW_API void swoole_set_worker_type(int type);
+SW_API char swoole_get_worker_symbol();
+
 namespace swoole {
+struct WorkerStopMessage {
+    pid_t pid;
+    uint16_t worker_id;
+};
 
 class ExitStatus {
-  private:
     pid_t pid_;
     int status_;
-  public:
-    ExitStatus(pid_t _pid, int _status) : pid_(_pid), status_(_status) {
 
-    }
+  public:
+    ExitStatus(pid_t _pid, int _status) : pid_(_pid), status_(_status) {}
 
     pid_t get_pid() const {
         return pid_;
@@ -66,57 +104,59 @@ class ExitStatus {
         return WTERMSIG(status_);
     }
 
-    bool is_normal_exit() {
+    bool is_normal_exit() const {
         return WIFEXITED(status_);
     }
 };
 
 static inline ExitStatus wait_process() {
     int status = 0;
-    pid_t pid = ::wait(&status);
-    return ExitStatus(pid, status);
+    pid_t pid = ::sw_wait(&status);
+    return {pid, status};
 }
 
 static inline ExitStatus wait_process(pid_t _pid, int options) {
     int status = 0;
-    pid_t pid = ::waitpid(_pid, &status, options);
-    return ExitStatus(pid, status);
+    pid_t pid = ::sw_waitpid(_pid, &status, options);
+    return {pid, status};
 }
+
+SW_API ExitStatus wait_process(const std::function<bool()> &should_wait);
 
 struct ProcessPool;
 struct Worker;
 
 struct WorkerGlobal {
-    /**
-     * Always run
-     */
-    bool run_always;
-    bool shutdown;
-    /**
-     * pipe_worker
-     */
-    int pipe_used;
-
+    WorkerId id;
+    pid_t pid;
     uint32_t max_request;
-
-    String **output_buffer;
+    uint8_t type;
+    bool shutdown;
+    bool running;
+    /**
+     * worker is shared memory, visible in other work processes.
+     * When a worker process restarts, it may be held by both the old and new processes simultaneously,
+     * necessitating careful handling of the state.
+     */
     Worker *worker;
-    time_t exit_time;
+    /**
+     *  worker_copy is a copy of worker,
+     *  but it must be local memory and only used within the current process or thread.
+     *  It is not visible to other worker processes.
+     */
+    Worker *worker_copy;
+    // Monotonic start of worker shutdown; all exit phases share the same wait budget.
+    int64_t exit_time_msec;
 };
 
 struct Worker {
-    /**
-     * worker process
-     */
     pid_t pid;
-
-    /**
-     * worker thread
-     */
-    pthread_t tid;
-
+    WorkerId id;
     ProcessPool *pool;
+#ifndef _WIN32
     MsgQueue *queue;
+#endif
+    bool shared;
 
     bool redirect_stdout;
     bool redirect_stdin;
@@ -127,58 +167,119 @@ struct Worker {
      */
     uint8_t status;
     uint8_t type;
-    uint8_t ipc_mode;
+    uint8_t msgqueue_mode;
     uint8_t child_process;
 
-    /**
-     * tasking num
-     */
-    sw_atomic_t tasking_num;
-
+    uint32_t concurrency;
     time_t start_time;
 
-    long dispatch_count;
-    long request_count;
-
-    /**
-     * worker id
-     */
-    uint32_t id;
+    sw_atomic_long_t dispatch_count;
+    sw_atomic_long_t request_count;
+    sw_atomic_long_t response_count;
+    size_t coroutine_num;
 
     Mutex *lock;
-
+#ifndef _WIN32
     UnixSocket *pipe_object;
+#endif
 
     network::Socket *pipe_master;
     network::Socket *pipe_worker;
     network::Socket *pipe_current;
 
     void *ptr;
-    void *ptr2;
 
-    ssize_t send_pipe_message(const void *buf, size_t n, int flags);
+    ssize_t send_pipe_message(const void *buf, size_t n, int flags) const;
+    bool has_exceeded_max_request() const;
+    void set_max_request(uint32_t max_request, uint32_t max_request_grace);
+    void report_error(const ExitStatus &exit_status) const;
+    /**
+     * Init global state for worker process.
+     * Must be called after the process is spawned and before the main loop is executed.
+     */
+    void init();
+    void shutdown();
+    bool is_shutdown();
+    static bool is_running();
+
+    void set_status(swWorkerStatus _status) {
+        status = _status;
+    }
+
+    void set_status_to_idle() {
+        set_status(SW_WORKER_IDLE);
+    }
+
+    void set_status_to_busy() {
+        set_status(SW_WORKER_BUSY);
+    }
+
+    void add_request_count() {
+        request_count++;
+    }
+
+    bool is_busy() const {
+        return status == SW_WORKER_BUSY;
+    }
+
+    bool is_idle() const {
+        return status == SW_WORKER_IDLE;
+    }
 };
 
 struct StreamInfo {
     network::Socket *socket;
     network::Socket *last_connection;
-    char *socket_file;
+    char *socket_address;
+    int socket_port;
     String *response_buffer;
 };
 
+struct ReloadTask {
+    std::unordered_map<pid_t, Worker *> workers;
+    std::queue<pid_t> kill_queue;
+    TimerNode *timer = nullptr;
+    pid_t current_pid = 0;
+    int timeout = 0;
+
+    size_t count() const {
+        return workers.size();
+    }
+
+    bool is_completed() const {
+        return workers.empty();
+    }
+
+    bool exists(pid_t pid) {
+        return workers.find(pid) != workers.end();
+    }
+
+    ReloadTask() = default;
+    ~ReloadTask();
+    void kill_one(int signal_number = SIGTERM);
+    void kill_all(int signal_number = SIGKILL);
+    void add_workers(Worker *list, size_t n);
+    void add_timeout_killer(int timeout);
+    bool remove(pid_t pid);
+    void clear_queue();
+};
+
 struct ProcessPool {
-    /**
-     * reloading
-     */
-    bool reloading;
     bool running;
     bool reload_init;
+    bool read_message;
     bool started;
-    uint8_t dispatch_mode;
+#ifndef _WIN32
+    bool schedule_by_sysvmsg;
+#endif
+    bool async;
+
     uint8_t ipc_mode;
-    uint32_t reload_worker_i;
+    swProtocolType protocol_type_;
+    pid_t master_pid;
     uint32_t max_wait_time;
-    Worker *reload_workers;
+    uint64_t reload_count;
+    time_t reload_last_time;
 
     /**
      * process type
@@ -193,7 +294,9 @@ struct ProcessPool {
     /**
      * use message queue IPC
      */
+#ifndef _WIN32
     uint8_t use_msgqueue;
+#endif
 
     /**
      * use stream socket IPC
@@ -206,7 +309,9 @@ struct ProcessPool {
     /**
      * message queue key
      */
+#ifndef _WIN32
     key_t msgqueue_key;
+#endif
 
     uint32_t worker_num;
     uint32_t max_request;
@@ -218,79 +323,167 @@ struct ProcessPool {
     uint8_t scheduler_warning;
     time_t warning_time;
 
-    int (*onTask)(ProcessPool *pool, swEventData *task);
-    void (*onWorkerStart)(ProcessPool *pool, int worker_id);
-    void (*onMessage)(ProcessPool *pool, const char *data, uint32_t length);
-    void (*onWorkerStop)(ProcessPool *pool, int worker_id);
-
-    int (*main_loop)(ProcessPool *pool, Worker *worker);
+    void (*onStart)(ProcessPool *pool);
+    void (*onShutdown)(ProcessPool *pool);
+    void (*onBeforeReload)(ProcessPool *pool);
+    void (*onAfterReload)(ProcessPool *pool);
+    int (*onTask)(ProcessPool *pool, Worker *worker, EventData *task);
+    void (*onWorkerStart)(ProcessPool *pool, Worker *worker);
+    void (*onMessage)(ProcessPool *pool, RecvData *msg);
+    void (*onWorkerExit)(ProcessPool *pool, Worker *worker);
+    void (*onWorkerStop)(ProcessPool *pool, Worker *worker);
+    void (*onWorkerError)(ProcessPool *pool, Worker *worker, const ExitStatus &exit_status);
+    void (*onWorkerMessage)(ProcessPool *pool, EventData *msg);
     int (*onWorkerNotFound)(ProcessPool *pool, const ExitStatus &exit_status);
+    int (*main_loop)(ProcessPool *pool, Worker *worker);
 
     sw_atomic_t round_id;
 
     Worker *workers;
+#ifndef _WIN32
     std::vector<std::shared_ptr<UnixSocket>> *pipes;
-    std::unordered_map<pid_t, Worker *> *map_;
-    Reactor *reactor;
     MsgQueue *queue;
+#endif
+    std::unordered_map<pid_t, Worker *> *map_;
     StreamInfo *stream_info_;
+    Channel *message_box = nullptr;
+    MessageBus *message_bus = nullptr;
+    sw_atomic_long_t *message_bus_msg_id = nullptr;
+    ReloadTask *reload_task = nullptr;
 
     void *ptr;
 
-    inline void set_type(int _type) {
-        uint32_t i;
-        type = _type;
-        for (i = 0; i < worker_num; i++) {
-            workers[i].type = type;
-        }
+    bool is_worker_id_valid(WorkerId worker_id) const {
+        return worker_id >= start_id && worker_id < (uint64_t) start_id + worker_num;
     }
 
-    inline void set_start_id(int _start_id) {
-        uint32_t i;
-        start_id = _start_id;
-        for (i = 0; i < worker_num; i++) {
-            workers[i].id = start_id + i;
-        }
-    }
-
-    inline Worker *get_worker(int worker_id) {
+    Worker *get_worker(WorkerId worker_id) const {
         return &(workers[worker_id - start_id]);
     }
 
-    void set_max_request(uint32_t _max_request, uint32_t _max_request_grace);
-    int get_max_request();
-    int set_protocol(int task_protocol, uint32_t max_packet_size);
-    int wait();
-    int start();
-    void shutdown();
-    pid_t spawn(Worker *worker);
-    int dispatch(EventData *data, int *worker_id);
-    int response(const char *data, int length);
-    int dispatch_blocking(swEventData *data, int *dst_worker_id);
-    int add_worker(Worker *worker);
-    int del_worker(Worker *worker);
-    void destroy();
-    int create_unix_socket(const char *socket_file, int blacklog);
-    int create_tcp_socket(const char *host, int port, int blacklog);
-    int schedule();
+    static TaskId get_task_id(const EventData *task) {
+        return task->info.fd;
+    }
 
-    static int create(ProcessPool *pool, uint32_t worker_num, key_t msgqueue_key, int ipc_mode);
+    static WorkerId get_task_src_worker_id(const EventData *task) {
+        return task->info.reactor_id;
+    }
+
+    void set_max_packet_size(uint32_t _max_packet_size) {
+        // SysV message queues have a fixed receive limit and ignore max_package_size.
+#ifndef _WIN32
+        max_packet_size_ = use_msgqueue ? SW_MSGMAX : _max_packet_size;
+#else
+        max_packet_size_ = _max_packet_size;
+#endif
+    }
+
+    bool is_master() const {
+        return swoole_get_worker_type() == SW_MASTER;
+    }
+
+    bool is_worker() const {
+        return swoole_get_worker_type() == SW_WORKER;
+    }
+
+    /**
+     * SW_PROTOCOL_TASK
+     * ==================================================================
+     * The `EventData` structure must be sent as a single message and cannot be split into multiple transmissions.
+     * If the length of the message content exceeds the size limit of the data field in EventData,
+     * it should be written to a temporary file.
+     * In this case, set the SW_TASK_TMPFILE flag in info.ext_flags.
+     * Only the path to the temporary file will be transmitted,
+     * and the receiving end should retrieve the actual message content from this temporary file.
+     * Reference: Server::task_pack()
+     *
+     * SW_PROTOCOL_MESSAGE
+     * ==================================================================
+     * When sending the `EventData` structure, the message can be split into multiple transmissions.
+     * When sending data in multiple parts, you must set a unique `info.msg_id`.
+     * For the first slice, set the `info.flags` with the SW_EVENT_DATA_CHUNK | SW_EVENT_DATA_BEGIN flag,
+     * and for the last slice, set the `info.flags` with the SW_EVENT_DATA_CHUNK | SW_EVENT_DATA_END flag.
+     * The receiving end will place the data into a memory cache table, merge the data,
+     * and only execute the onMessage callback once the complete message has been received.
+     *
+     * Reference: MessageBus::write() and MessageBus::read()
+     *
+     * SW_PROTOCOL_STREAM
+     * ==================================================================
+     *  +-------------------------------+-------------------------------+
+     *  | Payload Length     ( 4 byte, network byte order)              |
+     *  | Payload Data ...   ( Payload Length byte )                    |
+     *  +-------------------------------- - - - - - - - - - - - - - - - +
+     *
+     *  The packet consists of a 4 byte length header followed by the data payload.
+     *  The receiving end should first use `socket.recv(&payload_len, 4)` to obtain the length of the data payload.
+     *  Then, execute `socket.recv(payload, payload_len)` to receive the complete data.
+     *  Please note that sufficient memory space must be allocated for the payload,
+     *  for example, `payload = malloc(payload_len)`.
+     */
+    void set_protocol(swProtocolType _protocol_type);
+    void set_type(int _type);
+    void set_start_id(int _start_id);
+    void set_max_request(uint32_t _max_request, uint32_t _max_request_grace);
+    bool detach();
+#ifndef _WIN32
+    int wait();
+#endif
+    int start_check();
+    int start();
+    bool shutdown();
+    bool reload();
+    void reopen_logger();
+
+    void trigger_read_message_event() {
+        read_message = true;
+    }
+
+#ifndef _WIN32
+    pid_t spawn(Worker *worker);
+#endif
+    void stop(Worker *worker);
+    void kill_all_workers(int signo = SIGKILL);
+    swResultCode dispatch(EventData *data, int *worker_id);
+    int response(const char *data, uint32_t length) const;
+    swResultCode dispatch_sync(EventData *data, int *dst_worker_id);
+    swResultCode dispatch_sync(const char *data, uint32_t len) const;
+    void add_worker(Worker *worker) const;
+    bool del_worker(const Worker *worker) const;
+    Worker *get_worker_by_pid(pid_t pid) const;
+    void destroy();
+    int create(uint32_t worker_num, key_t msgqueue_key = 0, swIPCMode ipc_mode = SW_IPC_NONE, int msgqueue_perms = 0);
+    int create_message_box(size_t memory_size);
+    int create_message_bus();
+    int push_message(uint8_t _type, const void *data, size_t length) const;
+    int push_message(const EventData *msg) const;
+    bool send_message(WorkerId worker_id, const char *message, size_t l_message) const;
+    int pop_message(void *data, size_t size) const;
+    int listen(const char *socket_file, int backlog) const;
+    int listen(const char *host, int port, int backlog) const;
+    int schedule();
+    bool is_worker_running(Worker *worker) const;
+
+  private:
+    static int recv_packet(Reactor *reactor, Event *event);
+    static int recv_message(Reactor *reactor, Event *event);
+    static int run_with_task_protocol(ProcessPool *pool, Worker *worker);
+    static int run_with_stream_protocol(ProcessPool *pool, Worker *worker);
+    static int run_with_message_protocol(ProcessPool *pool, Worker *worker);
+    static int run_async(ProcessPool *pool, Worker *worker);
+    void at_worker_enter(Worker *worker) const;
+    void at_worker_exit(Worker *worker);
+
+    bool wait_detached_worker(std::unordered_set<pid_t> &detached_workers, pid_t pid);
 };
 };  // namespace swoole
 
-static sw_inline int swoole_waitpid(pid_t __pid, int *__stat_loc, int __options) {
-    int ret;
-    do {
-        ret = waitpid(__pid, __stat_loc, __options);
-    } while (ret < 0 && errno == EINTR);
-    return ret;
+static sw_inline int swoole_kill(pid_t _pid, int _sig) {
+    return sw_kill(_pid, _sig);
 }
 
-static sw_inline int swoole_kill(pid_t __pid, int __sig) {
-    if (__pid <= 0) {
-        return -1;
-    }
-    return kill(__pid, __sig);
-}
+extern SW_THREAD_LOCAL swoole::WorkerGlobal SwooleWG;
 
-extern swoole::WorkerGlobal SwooleWG;  // Worker Global Variable
+static inline swoole::Worker *sw_worker() {
+    return SwooleWG.worker;
+}

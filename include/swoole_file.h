@@ -10,18 +10,24 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_string.h"
 
+#ifdef _WIN32
+// <sys/stat.h> is available on Windows MSVC, <fcntl.h> provides O_* flags
+// <sys/file.h> is NOT available on Windows; flock() is replaced by sw_flock
+#include <sys/stat.h>
+#include <fcntl.h>
+#else
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#endif
 
 namespace swoole {
 
@@ -30,13 +36,13 @@ ssize_t file_get_size(int fd);
 ssize_t file_get_size(const std::string &filename);
 std::shared_ptr<String> file_get_contents(const std::string &filename);
 bool file_put_contents(const std::string &filename, const char *content, size_t length);
+bool file_exists(const std::string &filename);
 
 typedef struct stat FileStatus;
 
 class File {
-  private:
-    int fd_;
-    int flags_;
+    int fd_ = -1;
+    int flags_ = 0;
     std::string path_;
 
   public:
@@ -47,125 +53,174 @@ class File {
         CREATE = O_CREAT,
         EXCL = O_EXCL,
         APPEND = O_APPEND,
+#ifdef _WIN32
+        BINARY = _O_BINARY,
+#endif
     };
 
-    explicit File(int fd) {
-        fd_ = fd;
-        flags_ = 0;
-    }
+    explicit File(const int fd) noexcept : fd_(fd) {}
 
-    File(int fd, const std::string &path) {
-        fd_ = fd;
+    File(int fd, const std::string &path) : File(fd) {
         path_ = path;
-        flags_ = 0;
     }
 
-    File(const std::string &path, int oflags) {
-        fd_ = ::open(path.c_str(), oflags);
-        path_ = path;
-        flags_ = oflags;
-    }
+    File(const std::string &path, int oflags);
+    File(const std::string &path, int oflags, int mode);
+    File(const File &) = delete;
+    File &operator=(const File &) = delete;
+    File(File &&other) noexcept;
+    File &operator=(File &&other) noexcept;
+    ~File();
 
-    File(const std::string &path, int oflags, int mode) {
-        fd_ = ::open(path.c_str(), oflags, mode);
-        path_ = path;
-        flags_ = oflags;
-    }
+    bool open(const std::string &path, int oflags, int mode = 0);
+    bool close();
+    bool stat(FileStatus *_stat) const;
 
-    ~File() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
-    }
-
-    bool ready() {
+    bool ready() const {
         return fd_ != -1;
     }
 
-    ssize_t write(const void *__buf, size_t __n) const {
-        return ::write(fd_, __buf, __n);
+    ssize_t write(const void *_buf, size_t _n) const {
+#ifdef _WIN32
+        return _write(fd_, _buf, static_cast<unsigned int>(_n));
+#else
+        return ::write(fd_, _buf, _n);
+#endif
     }
 
-    ssize_t read(void *__buf, size_t __n) const {
-        return ::read(fd_, __buf, __n);
+    ssize_t write(const std::string &str) const {
+        return write(str.c_str(), str.length());
     }
 
-    ssize_t pwrite(const void *__buf, size_t __n, off_t __offset) const {
-        return ::pwrite(fd_, __buf, __n, __offset);
+    ssize_t read(void *_buf, const size_t _n) const {
+#ifdef _WIN32
+        return _read(fd_, _buf, static_cast<unsigned int>(_n));
+#else
+        return ::read(fd_, _buf, _n);
+#endif
     }
 
-    ssize_t pread(void *__buf, size_t __n, off_t __offset) const {
-        return ::pread(fd_, __buf, __n, __offset);
+    ssize_t pwrite(const void *_buf, size_t _n, off_t _offset) const {
+        return ::sw_pwrite(fd_, _buf, _n, _offset);
     }
 
-    size_t write_all(const void *__buf, size_t __n);
-    size_t read_all(void *__buf, size_t __n);
-
-    std::shared_ptr<String> read_content();
-
-    bool stat(FileStatus *_stat) const {
-        if (::fstat(fd_, _stat) < 0) {
-            swSysWarn("fstat() failed");
-            return false;
-        } else {
-            return true;
-        }
+    ssize_t pread(void *_buf, const size_t _n, off_t _offset) const {
+        return ::sw_pread(fd_, _buf, _n, _offset);
     }
 
-    bool sync() {
+    size_t write_all(const void *data, size_t len) const;
+    size_t read_all(void *buf, size_t len) const;
+    /**
+     * Read one line of file, reading ends when __n - 1 bytes have been read,
+     * or a newline (which is included in the return value),
+     * or an EOF (read bytes less than __n)
+     * Returns length of line on success, -1 otherwise.
+     * NOTE: `buf` must be ended with zero.
+     */
+    ssize_t read_line(void *_buf, size_t _n) const;
+
+    std::shared_ptr<String> read_content() const;
+
+    bool sync() const {
+#ifdef _WIN32
+        return _commit(fd_) == 0;
+#else
         return ::fsync(fd_) == 0;
+#endif
     }
 
-    bool truncate(size_t size) {
-        return ::ftruncate(fd_, size) == 0;
+    bool truncate(off_t length) const {
+#ifdef _WIN32
+        return _chsize(fd_, length) == 0;
+#else
+        return ::ftruncate(fd_, length) == 0;
+#endif
     }
 
-    off_t set_offest(off_t offset) {
+    off_t set_offset(off_t offset) const {
+#ifdef _WIN32
+        return _lseeki64(fd_, offset, SEEK_SET);
+#else
         return lseek(fd_, offset, SEEK_SET);
+#endif
     }
 
-    off_t get_offset() {
+    off_t get_offset() const {
+#ifdef _WIN32
+        return _lseeki64(fd_, 0, SEEK_CUR);
+#else
         return lseek(fd_, 0, SEEK_CUR);
+#endif
     }
 
-    bool lock(int operation) {
-        return ::flock(fd_, operation) == 0;
+    bool lock(int operation) const {
+        return ::sw_flock(fd_, operation) == 0;
     }
 
-    bool unlock() {
-        return ::flock(fd_, LOCK_UN) == 0;
+    bool unlock() const {
+        return ::sw_flock(fd_, LOCK_UN) == 0;
     }
 
-    ssize_t get_size() {
+    ssize_t get_size() const {
         return file_get_size(fd_);
-    }
-
-    bool close() {
-        if (fd_ == -1) {
-            return false;
-        }
-        int tmp_fd = fd_;
-        fd_ = -1;
-        return ::close(tmp_fd) == 0;
     }
 
     void release() {
         fd_ = -1;
     }
 
-    int get_fd() {
+    int get_fd() const {
         return fd_;
     }
 
-    const std::string &get_path() {
+    const std::string &get_path() const {
         return path_;
     }
 
     static bool exists(const std::string &file) {
-        return access(file.c_str(), R_OK) == 0;
+        return ::access(file.c_str(), F_OK) == 0;
+    }
+
+    static bool remove(const std::string &file) {
+        return ::remove(file.c_str()) == 0;
     }
 };
 
 File make_tmpfile();
 
+class AsyncFile {
+  private:
+    int fd = -1;
+    int flags_ = 0;
+    mode_t mode_ = 0;
+    std::string path_;
+
+  public:
+    AsyncFile(const std::string &path, int flags, int mode);
+    ~AsyncFile();
+
+    bool open(const std::string &path, int flags, mode_t mode);
+    bool close();
+
+    ssize_t read(void *buf, size_t count) const;
+    ssize_t write(const void *buf, size_t count) const;
+    ssize_t write(const String *buf) const {
+        return write(SW_STRINGL(buf));
+    }
+
+    bool sync() const;
+    bool truncate(off_t length) const;
+    bool stat(FileStatus *statbuf) const;
+
+    off_t get_offset() const;
+    off_t set_offset(off_t offset) const;
+
+    bool ready() const {
+        return fd != -1;
+    }
+
+    int get_fd() const {
+        return fd;
+    }
+};
 }  // namespace swoole

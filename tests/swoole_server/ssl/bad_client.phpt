@@ -1,7 +1,9 @@
 --TEST--
 swoole_server/ssl: ssl bad client
 --SKIPIF--
-<?php require __DIR__ . '/../../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../../include/skipif.inc';
+skip_if_darwin();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../../include/bootstrap.php';
@@ -9,20 +11,22 @@ require __DIR__ . '/../../include/bootstrap.php';
 define('ERROR_FILE', __DIR__.'/ssl_error');
 
 $pm = new SwooleTest\ProcessManager;
+$rdata = "hello world";
 
-$pm->parentFunc = function ($pid) use ($pm) {
-    $client = new swoole_client(SWOOLE_SOCK_TCP, SWOOLE_SOCK_SYNC); //同步阻塞
-    if (!$client->connect('127.0.0.1', $pm->getFreePort()))
-    {
+$pm->parentFunc = function ($pid) use ($pm, $rdata) {
+    $client = new Swoole\Client(SWOOLE_SOCK_TCP, SWOOLE_SOCK_SYNC); //同步阻塞
+    if (!$client->connect('127.0.0.1', $pm->getFreePort())) {
         exit("connect failed\n");
     }
-    $client->send("hello world");
-    Assert::same($client->recv(), "");
+    $client->send($rdata);
+    // Rejecting plaintext during the TLS handshake may close or reset the connection.
+    $data = @$client->recv();
+    Assert::true($data === '' || $data === false);
     $pm->kill();
 };
 
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE, SWOOLE_SOCK_TCP | SWOOLE_SSL);
+    $serv = new Swoole\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE, SWOOLE_SOCK_TCP | SWOOLE_SSL);
     $serv->set(
         [
             'log_file' => ERROR_FILE,
@@ -41,8 +45,16 @@ $pm->childFunc = function () use ($pm) {
 
 $pm->childFirst();
 $pm->run();
-readfile(ERROR_FILE);
-unlink(ERROR_FILE);
+for ($i = 0; $i < 50; $i++) {
+    if (is_file(ERROR_FILE) && filesize(ERROR_FILE) > 0) {
+        break;
+    }
+    usleep(20000);
+}
+if (is_file(ERROR_FILE)) {
+    readfile(ERROR_FILE);
+    unlink(ERROR_FILE);
+}
 ?>
 --EXPECTF--
-[%s]	WARNING	ssl_accept: bad SSL client[127.0.0.1:%d], reason=%d, error_string=%s
+[%s]	WARNING	Socket::ssl_accept(): bad SSL client[127.0.0.1:%d], reason=%d, error_string=%s

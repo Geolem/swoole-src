@@ -13,36 +13,34 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
 #include "swoole.h"
 #include "swoole_hash.h"
 
-static const int CRC32_TABLE_SIZE = 256;
-static uint32_t crc32_table[CRC32_TABLE_SIZE];
-static bool generated = false;
+static constexpr int CRC32_TABLE_SIZE = 256;
 
-static void generate_table(uint32_t (&table)[CRC32_TABLE_SIZE]) {
-    uint32_t polynomial = 0xEDB88320;
-    for (uint32_t i = 0; i < CRC32_TABLE_SIZE; i++) {
-        uint32_t c = i;
-        for (size_t j = 0; j < 8; j++) {
-            if (c & 1) {
-                c = polynomial ^ (c >> 1);
-            } else {
-                c >>= 1;
+struct Crc32Table {
+    uint32_t values[CRC32_TABLE_SIZE];
+
+    Crc32Table() {
+        const uint32_t polynomial = 0xEDB88320;
+        for (uint32_t i = 0; i < CRC32_TABLE_SIZE; i++) {
+            uint32_t c = i;
+            for (size_t j = 0; j < 8; j++) {
+                c = (c & 1) ? polynomial ^ (c >> 1) : c >> 1;
             }
+            values[i] = c;
         }
-        table[i] = c;
     }
-}
+};
 
-uint32_t swoole_crc32(const char *data, uint32_t size) {
-    if (sw_unlikely(!generated)) {
-        generate_table(crc32_table);
-    }
+uint32_t swoole_crc32(const char *data, size_t size) {
+    // Function-local statics are initialized exactly once, even from several threads.
+    static const Crc32Table table;
+    const uint32_t *crc32_table = table.values;
 
     uint32_t crcinit = 0;
     uint32_t crc = crcinit ^ 0xffffffff;

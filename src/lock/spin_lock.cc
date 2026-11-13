@@ -10,62 +10,48 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
 #include "swoole_lock.h"
 
 #ifdef HAVE_SPINLOCK
-
 namespace swoole {
-
-SpinLock::SpinLock(int use_in_process) : Lock() {
-    if (use_in_process) {
+SpinLock::SpinLock(bool shared) : Lock(SPIN_LOCK, shared) {
+    if (shared) {
         impl = (pthread_spinlock_t *) sw_mem_pool()->alloc(sizeof(*impl));
         if (impl == nullptr) {
             throw std::bad_alloc();
         }
-        shared_ = true;
     } else {
         impl = new pthread_spinlock_t();
-        shared_ = false;
     }
 
-    type_ = SPIN_LOCK;
-    if (pthread_spin_init(impl, use_in_process) < 0) {
-        throw std::system_error(errno, std::generic_category(), "pthread_spin_init() failed");
+    int err = pthread_spin_init(impl, shared);
+    if (err != 0) {
+        free_ptr(impl);
+        throw std::system_error(err, std::generic_category(), "pthread_spin_init() failed");
     }
 }
 
-int SpinLock::lock() {
+int SpinLock::lock(int operation, int timeout_msec) {
+    if (operation & LOCK_NB) {
+        return pthread_spin_trylock(impl);
+    }
+    if (timeout_msec > 0) {
+        return sw_wait_for([this]() { return pthread_spin_trylock(impl) == 0; }, timeout_msec) ? 0 : ETIMEDOUT;
+    }
     return pthread_spin_lock(impl);
-}
-
-int SpinLock::lock_rd() {
-    return lock();
 }
 
 int SpinLock::unlock() {
     return pthread_spin_unlock(impl);
 }
 
-int SpinLock::trylock() {
-    return pthread_spin_trylock(impl);
-}
-
-int SpinLock::trylock_rd() {
-    return trylock();
-}
-
 SpinLock::~SpinLock() {
     pthread_spin_destroy(impl);
-    if (shared_) {
-        sw_mem_pool()->free((void *) impl);
-    } else {
-        delete impl;
-    }
+    free_ptr(impl);
 }
 }  // namespace swoole
 #endif

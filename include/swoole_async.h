@@ -12,16 +12,15 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
 #pragma once
 
+#include "swoole_socket.h"
+
 #include <vector>
-#include <string>
-#include <mutex>
-#include <atomic>
 
 #ifndef O_DIRECT
 #define O_DIRECT 040000
@@ -29,29 +28,27 @@
 
 namespace swoole {
 
-enum AsyncFlags {
+enum AsyncFlag {
     SW_AIO_WRITE_FSYNC = 1u << 1,
     SW_AIO_EOF = 1u << 2,
 };
 
+struct AsyncRequest {
+    virtual ~AsyncRequest() = default;
+};
+
 struct AsyncEvent {
-    int fd;
     size_t task_id;
-    uint8_t lock;
     uint8_t canceled;
+    int error;
     /**
      * input & output
      */
-    uint16_t flags;
-    off_t offset;
-    size_t nbytes;
-    void *buf;
-    void *req;
+    std::shared_ptr<AsyncRequest> data;
     /**
      * output
      */
-    ssize_t ret;
-    int error;
+    ssize_t retval;
     /**
      * internal use only
      */
@@ -60,26 +57,68 @@ struct AsyncEvent {
     void *object;
     void (*handler)(AsyncEvent *event);
     void (*callback)(AsyncEvent *event);
+
+    bool catch_error() const {
+        return (error == SW_ERROR_AIO_TIMEOUT || error == SW_ERROR_AIO_CANCELED);
+    }
+};
+
+struct GethostbynameRequest : AsyncRequest {
+    std::string name;
+    int family;
+    std::string addr;
+
+    GethostbynameRequest(std::string _name, int _family);
+    ~GethostbynameRequest() override = default;
+};
+
+struct GetaddrinfoRequest : public AsyncRequest {
+    std::string hostname;
+    std::string service;
+    int family;
+    int socktype;
+    int protocol;
+    int error;
+    std::vector<sockaddr_in6> results;
+    int count;
+
+    void parse_result(std::vector<std::string> &retval) const;
+
+    GetaddrinfoRequest(std::string _hostname, int _family, int _socktype, int _protocol, std::string _service);
+    ~GetaddrinfoRequest() override = default;
 };
 
 class AsyncThreads {
   public:
-    bool schedule = false;
-    uint32_t task_num = 0;
-    Pipe *pipe = nullptr;
-    async::ThreadPool *pool = nullptr;
+    size_t task_num = 0;
+    SocketPair *pipe = nullptr;
+    std::shared_ptr<async::ThreadPool> pool;
     network::Socket *read_socket = nullptr;
     network::Socket *write_socket = nullptr;
 
     AsyncThreads();
     ~AsyncThreads();
 
-    size_t thread_count();
-    void notify_one();
+    size_t get_task_num() const {
+        return task_num;
+    }
+
+    size_t get_queue_size() const;
+    size_t get_worker_num() const;
+    size_t get_idle_worker_num() const;
+    size_t get_pending_release_worker_num() const;
+    size_t get_peak_worker_num() const;
+    size_t get_created_worker_num() const;
+    size_t get_released_worker_num() const;
+    size_t get_scale_up_count() const;
+    size_t get_scale_down_count() const;
+    void notify_one() const;
 
     static int callback(Reactor *reactor, Event *event);
+
   private:
-    std::mutex init_lock;
+    AsyncEvent *completed_events[SW_AIO_EVENT_NUM] = {};
+    size_t completed_event_bytes = 0;
 };
 
 namespace async {
@@ -93,3 +132,5 @@ void handler_getaddrinfo(AsyncEvent *event);
 
 }  // namespace async
 };  // namespace swoole
+
+swoole::AsyncThreads *sw_async_threads();

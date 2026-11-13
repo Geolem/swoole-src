@@ -21,11 +21,12 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
         $ret = $cli->recv();
         Assert::same($ret->data, "Hello {$data}!");
         $s = microtime(true);
+        // An empty string was received, indicating that the connection has been closed by the peer
         $ret = $cli->recv();
         Assert::lessThan(microtime(true) - $s, 0.002);
-        Assert::same($ret, false);
+        Assert::same($ret, "");
     });
-    swoole_event_wait();
+    Swoole\Event::wait();
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
@@ -53,7 +54,7 @@ $pm->childFunc = function () use ($pm) {
         $pm->wakeup();
         $server->start();
     });
-    swoole_event_wait();
+    Swoole\Event::wait();
 };
 $pm->childFirst();
 $pm->run();

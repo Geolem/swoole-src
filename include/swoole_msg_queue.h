@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -19,15 +19,22 @@
 
 #include "swoole.h"
 
+#ifndef _WIN32
 #include <sys/types.h>
+#endif
 
-namespace swoole {
-
-struct QueueNode {
-    long mtype;                      /* type of received/sent message */
-    char mdata[sizeof(EventData)];   /* text of the message */
+enum {
+    SW_MSGQUEUE_ORIENT = 1,
+    SW_MSGQUEUE_BALANCE = 2,
 };
 
+namespace swoole {
+struct QueueNode {
+    long mtype;                    /* type of received/sent message */
+    char mdata[sizeof(EventData)]; /* text of the message */
+};
+
+#ifndef _WIN32
 class MsgQueue {
   private:
     bool blocking_;
@@ -35,23 +42,26 @@ class MsgQueue {
     key_t msg_key_;
     int flags_;
     int perms_;
+
   public:
     explicit MsgQueue(key_t msg_key, bool blocking = true, int perms = 0);
     ~MsgQueue();
 
-    bool ready() {
+    bool ready() const {
         return msg_id_ >= 0;
     }
 
-    int get_id() {
+    int get_id() const {
         return msg_id_;
     }
 
     void set_blocking(bool blocking);
-    bool set_capacity(size_t queue_bytes);
-    bool push(QueueNode *in, size_t mdata_length);
-    ssize_t pop(QueueNode *out, size_t mdata_size);
-    bool stat(size_t *queue_num, size_t *queue_bytes);
+    bool set_access(uid_t uid, gid_t gid, mode_t mode);
+    bool set_capacity(size_t queue_bytes) const;
+    bool push(const QueueNode *in, size_t mdata_length) const;
+    ssize_t pop(QueueNode *out, size_t mdata_size) const;
+    bool stat(size_t *queue_num, size_t *queue_bytes) const;
     bool destroy();
 };
-}
+#endif
+}  // namespace swoole

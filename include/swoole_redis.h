@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -21,43 +21,37 @@
 #include <vector>
 #include <string>
 
-enum swRedis_receive_state {
-    SW_REDIS_RECEIVE_TOTAL_LINE,
-    SW_REDIS_RECEIVE_LENGTH,
-    SW_REDIS_RECEIVE_STRING,
-};
-
-enum swRedis_reply_type {
-    SW_REDIS_REPLY_ERROR,
-    SW_REDIS_REPLY_NIL,
-    SW_REDIS_REPLY_STATUS,
-    SW_REDIS_REPLY_INT,
-    SW_REDIS_REPLY_STRING,
-    SW_REDIS_REPLY_SET,
-    SW_REDIS_REPLY_MAP,
-};
-
 #define SW_REDIS_RETURN_NIL "$-1\r\n"
 
 #define SW_REDIS_MAX_COMMAND_SIZE 64
 #define SW_REDIS_MAX_LINES 128
 #define SW_REDIS_MAX_STRING_SIZE 536870912  // 512M
 
-static sw_inline const char *swRedis_get_number(const char *p, int *_ret) {
-    char *endptr;
-    p++;
-    int ret = strtol(p, &endptr, 10);
-    if (strncmp(SW_CRLF, endptr, SW_CRLF_LEN) == 0) {
-        p += (endptr - p) + SW_CRLF_LEN;
-        *_ret = ret;
-        return p;
-    } else {
-        return nullptr;
-    }
-}
+namespace swoole {
+namespace redis {
 
-int swRedis_recv_packet(swProtocol *protocol, swConnection *conn, swString *buffer);
-std::vector<std::string> swRedis_parse(const char *data, size_t len);
-bool swRedis_format(swString *buf);
-bool swRedis_format(swString *buf, enum swRedis_reply_type type, const std::string &value);
-bool swRedis_format(swString *buf, enum swRedis_reply_type type, long value);
+enum State {
+    STATE_RECEIVE_TOTAL_LINE,
+    STATE_RECEIVE_LENGTH,
+    STATE_RECEIVE_STRING,
+};
+
+enum ReplyType {
+    REPLY_ERROR,
+    REPLY_NIL,
+    REPLY_STATUS,
+    REPLY_INT,
+    REPLY_STRING,
+    REPLY_SET,
+    REPLY_MAP,
+};
+
+const char *get_number(const char *p, int *_ret);
+int recv_packet(Protocol *protocol, Connection *conn, String *buffer);
+std::vector<std::string> parse(const char *data, size_t len);
+void format_nil(String *buf);
+void format(String *buf, ReplyType type, const std::string &value);
+void format(String *buf, ReplyType type, long value);
+
+}  // namespace redis
+}  // namespace swoole

@@ -77,7 +77,7 @@ $pm->parentFunc = function ($pid) use ($pm) {
             });
         });
     }
-    swoole_event::wait();
+    Swoole\Event::wait();
     $pm->kill();
     echo "DONE\n";
 };
@@ -86,6 +86,7 @@ $pm->childFunc = function () use ($pm) {
         $server = new Co\Socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         Assert::assert($server->bind('127.0.0.1', $pm->getFreePort()));
         Assert::assert($server->listen(MAX_CONCURRENCY));
+        $pm->wakeup();
         while ($conn = $server->accept(-1)) {
             if (!Assert::assert($conn instanceof Co\Socket)) {
                 throw new RuntimeException('accept failed');

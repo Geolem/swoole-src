@@ -1,34 +1,72 @@
 --TEST--
 swoole_http2_client_coro: connect twice
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
+use Swoole\Coroutine\Channel;
+use Swoole\Coroutine\Http2\Client;
+use Swoole\Http2\Request;
+use Swoole\Http2\Response;
 use function Swoole\Coroutine\run;
 use function Swoole\Coroutine\go;
 
 run(function () {
-    $client = new \Swoole\Coroutine\Http2\Client('www.zhihu.com', 443, true);
-    $chan   = new \Swoole\Coroutine\Channel(1);
-    go(function () use ($client, $chan) {
-        $client->connect();
-        $req = new \Swoole\Http2\Request();
+    $domain = 'httpbingo.org';
+    $client = new Client($domain, 443, true);
+    $client->set([
+        'timeout' => 5,
+        'ssl_host_name' => $domain,
+    ]);
+    $chan = new Channel(1);
+    go(function () use ($client, $chan, $domain) {
+        $connected = $client->connect();
+        if (!Assert::true(
+            $connected,
+            "connect failed: {$client->errCode} {$client->errMsg}"
+        )) {
+            return;
+        }
+        $req = new Request();
+        $uuid = uniqid();
         $req->method = 'GET';
-        $req->path   = '/io?io=' . str_repeat('xxx', 1000);
-        $client->send($req);
+        $req->path = '/base64/' . base64_encode($uuid);
+        $req->headers = [
+            'host' => $domain,
+            'user-agent' => 'swoole-http2-client',
+        ];
+        $streamId = $client->send($req);
+        Assert::greaterThan(
+            $streamId,
+            0,
+            "send failed: {$client->errCode} {$client->errMsg}"
+        );
         $chan->push(true);
         $resp = $client->recv();
-        Assert::eq($resp->statusCode, 200);
-        Assert::contains($resp->data, '知乎');
+        if (Assert::isInstanceOf(
+            $resp,
+            Response::class,
+            "recv failed: {$client->errCode} {$client->errMsg}"
+        )) {
+            Assert::eq($resp->statusCode, 200);
+            Assert::eq($resp->data, $uuid);
+        }
         $chan->pop();
     });
-    go(function () use ($client, $chan) {
+    go(function () use ($client, $chan, $domain) {
         Assert::eq($client->connect(), false);
-        $req = new \Swoole\Http2\Request();
+        $uuid = uniqid();
+        $req = new Request();
         $req->method = 'GET';
-        $req->path   = '/io?io=xxx';
+        $req->path = '/base64/' . base64_encode($uuid);
+        $req->headers = [
+            'host' => $domain,
+            'user-agent' => 'swoole-http2-client',
+        ];
         $client->send($req);
         $chan->push(true);
         Assert::eq($client->recv(), false);

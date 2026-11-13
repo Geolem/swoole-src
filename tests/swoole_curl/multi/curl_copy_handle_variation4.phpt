@@ -1,6 +1,7 @@
 --TEST--
-curl_copy_handle() allows to post CURLFile multiple times with curl_multi_exec()
+swoole_curl/multi: curl_copy_handle() allows to post CURLFile multiple times with curl_multi_exec()
 --SKIPIF--
+<?php require __DIR__ . '/../../include/skipif.inc'; ?>
 --FILE--
 <?php
 require __DIR__ . '/../../include/bootstrap.php';
@@ -37,11 +38,13 @@ $cm->run(function ($host) {
     curl_multi_remove_handle($mh, $ch3);
     curl_multi_close($mh);
 });
+echo PHP_EOL;
 ?>
 ===DONE===
 --EXPECT--
 bool(true)
-АБВ.txt|application/octet-stream|5АБВ.txt|application/octet-stream|5===DONE===
+АБВ.txt|application/octet-stream|5АБВ.txt|application/octet-stream|5
+===DONE===
 --CLEAN--
 <?php
 @unlink(__DIR__ . '/АБВ.txt');

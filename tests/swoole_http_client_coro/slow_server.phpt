@@ -32,16 +32,16 @@ $pm->parentFunc = function ($pid) use ($pm) {
         $pm->kill();
         echo "OK\n";
     });
-    swoole_event::wait();
+    Swoole\Event::wait();
 };
 
 $pm->childFunc = function () use ($pm)
 {
-    $serv = new swoole_server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
+    $serv = new Swoole\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
     $serv->set(array(
         'log_file' => '/dev/null'
     ));
-    $serv->on('WorkerStart', function (\swoole_server $serv)
+    $serv->on('WorkerStart', function (Swoole\Server $serv)
     {
         /**
          * @var $pm ProcessManager
@@ -51,13 +51,13 @@ $pm->childFunc = function () use ($pm)
     });
     $serv->on('receive', function ($serv, $fd, $threadId, $data)
     {
-        $html = base64_encode(random_bytes(rand(1024, 65536)));
+        $html = base64_encode(random_bytes(8192));
         $len = strlen($html);
         $data = "HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: $len\r\nX-Server: swoole\r\n\r\n$html";
-        $chunks = str_split($data, 5);
+        $chunks = str_split($data, 128);
         foreach ($chunks as $out) {
             $serv->send($fd, $out);
-            usleep(100);
+            usleep(1000);
         }
     });
     $serv->start();

@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -23,43 +23,20 @@
 
 #define SW_STRINGL(s) s->str, s->length
 #define SW_STRINGS(s) s->str, s->size
+// copy value
 #define SW_STRINGCVL(s) s->str + s->offset, s->length - s->offset
+// append value
+#define SW_STRINGAVL(s) s->str + s->length, s->size - s->length
 
 namespace swoole {
-
 typedef std::function<bool(const char *, size_t)> StringExplodeHandler;
 
 class String {
   private:
-    void alloc(size_t _size, const Allocator *_allocator) {
-        if (_allocator == nullptr) {
-            _allocator = sw_std_allocator();
-        }
-
-        _size = SW_MEM_ALIGNED_SIZE(_size);
-        length = 0;
-        size = _size;
-        offset = 0;
-        str = (char *) _allocator->malloc(_size);
-        allocator = _allocator;
-
-        if (str == nullptr) {
-            throw std::bad_alloc();
-        }
-    }
-
-    void move(String &&src) {
-        str = src.str;
-        length = src.length;
-        offset = src.offset;
-        size = src.size;
-        allocator = src.allocator;
-
-        src.str = nullptr;
-        src.length = 0;
-        src.size = 0;
-        src.offset = 0;
-    }
+    void alloc(size_t _size, const Allocator *_allocator);
+    void move(String &&src);
+    static size_t checked_add(size_t left, size_t right);
+    static size_t growth_capacity(size_t current, size_t required);
 
   public:
     size_t length;
@@ -79,184 +56,194 @@ class String {
     }
 
     String(const char *_str, size_t _length) {
-        alloc(_length, nullptr);
+        alloc(checked_add(_length, 1), nullptr);
         memcpy(str, _str, _length);
+        str[_length] = '\0';
         length = _length;
     }
 
-    String(String &_str) {
-        alloc(_str.size, _str.allocator);
-        memcpy(_str.str, str, _str.length);
-        length = _str.length;
-        offset = _str.offset;
-    }
+    explicit String(const std::string &_str) : String(_str.c_str(), _str.length()) {}
 
-    String(String &&src) {
+    String(const String &src);
+
+    String(String &&src) noexcept {
         move(std::move(src));
     }
 
-    String &operator=(String &src) {
-        if (&src == this) {
-            return *this;
-        }
-        if (allocator && str) {
-            allocator->free(str);
-        }
-        alloc(src.size, src.allocator);
-        memcpy(src.str, str, src.length);
-        length = src.length;
-        offset = src.offset;
-        return *this;
-    }
-
-    String &operator=(String &&src) {
-        if (&src == this) {
-            return *this;
-        }
-        if (allocator && str) {
-            allocator->free(str);
-        }
-        move(std::move(src));
-        return *this;
-    }
+    String &operator=(const String &src);
+    String &operator=(String &&src) noexcept;
 
     ~String() {
         if (allocator && str) {
-            allocator->free(str);
+            (allocator->free)(str);
         }
     }
 
-    inline char *value() {
+    char *value() const {
         return str;
     }
 
-    inline size_t get_length() {
+    size_t get_length() const {
         return length;
     }
 
-    inline size_t capacity() {
+    size_t capacity() const {
         return size;
     }
 
-    inline std::string to_std_string() {
-        return std::string(str, length);
+    std::string to_std_string() const {
+        return {str, length};
     }
 
-    inline bool contains(const char *needle, size_t l_needle) {
+    bool contains(const char *needle, size_t l_needle) const {
         return swoole_strnstr(str, length, needle, l_needle) != nullptr;
     }
 
-    inline bool contains(const std::string &needle) {
+    bool contains(const std::string &needle) const {
         return contains(needle.c_str(), needle.size());
     }
 
-    inline bool grow(size_t incr_value) {
-        length += incr_value;
-        if (length == size && !reserve(size * 2)) {
+    bool starts_with(const char *needle, size_t l_needle) const {
+        if (length < l_needle) {
             return false;
-        } else {
-            return true;
         }
+        return memcmp(str, needle, l_needle) == 0;
     }
 
-    String *substr(size_t offset, size_t len) {
-        if (offset + len > length) {
-            return nullptr;
-        }
-        auto _substr = new String(len);
-        _substr->append(str + offset, len);
-        return _substr;
+    bool starts_with(const std::string &needle) const {
+        return starts_with(needle.c_str(), needle.length());
     }
 
-    bool empty() {
+    bool ends_with(const char *needle, size_t l_needle) const {
+        if (length < l_needle) {
+            return false;
+        }
+        return memcmp(str + length - l_needle, needle, l_needle) == 0;
+    }
+
+    bool ends_with(const std::string &needle) const {
+        return ends_with(needle.c_str(), needle.length());
+    }
+
+    bool equals(const char *data, size_t len) const {
+        if (length != len) {
+            return false;
+        }
+        return memcmp(str, data, len) == 0;
+    }
+
+    bool equals(const std::string &data) const {
+        if (length != data.size()) {
+            return false;
+        }
+        return memcmp(str, data.c_str(), length) == 0;
+    }
+
+    void grow(size_t incr_value);
+    String substr(size_t offset, size_t len) const;
+
+    bool empty() const {
         return str == nullptr || length == 0;
     }
 
-    inline void clear() {
+    void clear() {
         length = 0;
         offset = 0;
     }
 
-    inline bool extend() {
-        return extend(size * 2);
+    void extend() {
+        extend(checked_add(size, size));
     }
 
-    inline bool extend(size_t new_size) {
+    void extend(size_t new_size) {
         assert(new_size > size);
-        return reserve(new_size);
+        reserve(new_size);
     }
 
-    inline bool extend_align(size_t _new_size) {
-        size_t align_size = SW_MEM_ALIGNED_SIZE(size * 2);
-        while (align_size < _new_size) {
-            align_size *= 2;
-        }
-        return reserve(align_size) ;
+    void extend_align(size_t _new_size) {
+        reserve(growth_capacity(size, _new_size));
     }
 
-    bool reserve(size_t new_size);
-    bool repeat(const char *data, size_t len, size_t n);
-    int append(const char *append_str, size_t length);
+    void reserve(size_t new_size);
+    /**
+     * Transfer ownership of the string content pointer to the caller, who will capture this memory.
+     * The caller must manage and free this memory; it will not free when the string is destructed.
+     */
+    char *release();
+    void repeat(const char *data, size_t len, size_t n);
+    void append(const char *append_str, size_t length);
 
-    inline int append(const std::string &append_str) {
-        return append(append_str.c_str(), append_str.length());
+    void append(const std::string &append_str) {
+        append(append_str.c_str(), append_str.length());
     }
 
-    inline int append(const String &append_str) {
-        size_t new_size = length + append_str.length;
-        if (new_size > size) {
-            if (!reserve(new_size)) {
-                return SW_ERR;
-            }
-        }
-
-        memcpy(str + length, append_str.str, append_str.length);
-        length += append_str.length;
-        return SW_OK;
+    void append(const char c) {
+        append(&c, sizeof(c));
     }
 
-    inline void write(off_t _offset, swString *write_str) {
-        size_t new_length = _offset + write_str->length;
-        if (new_length > size) {
-            reserve(swoole_size_align(new_length * 2, SwooleG.pagesize));
-        }
+    void append(int value);
+    void append(const String &append_str);
+    bool append_random_bytes(size_t length, bool base64 = false);
 
-        memcpy(str + _offset, write_str->str, write_str->length);
-        if (new_length > length) {
-            length = new_length;
+    void write(off_t _offset, const String &write_str);
+    void write(off_t _offset, const char *write_str, size_t _length);
+
+    void set_null_terminated() {
+        if (length == size) {
+            extend(checked_add(length, 1));
         }
+        str[length] = '\0';
     }
-
-    inline void write(off_t _offset, const char *write_str, size_t _length) {
-        size_t new_length = _offset + _length;
-        if (new_length > size) {
-            reserve(swoole_size_align(new_length * 2, SwooleG.pagesize));
-        }
-
-        memcpy(str + _offset, write_str, _length);
-        if (new_length > length) {
-            length = new_length;
-        }
-    }
-
-    int append(int value);
 
     ssize_t split(const char *delimiter, size_t delimiter_length, const StringExplodeHandler &handler);
-    int append_random_bytes(size_t length, bool base64 = false);
-    void print();
+    void print(bool print_value = true) const;
+
+    enum FormatFlag {
+        FORMAT_APPEND = 1 << 0,
+        FORMAT_GROW = 1 << 1,
+    };
 
     template <typename... Args>
-    inline size_t format(const char *format, Args... args) {
+    size_t format_impl(int flags, const char *format, Args... args) {
         size_t _size = sw_snprintf(nullptr, 0, format, args...);
         if (_size == 0) {
             return 0;
         }
         // store \0 terminator
-        _size++;
-        if (_size > size && !reserve(_size)) {
-            return 0;
+        _size = checked_add(_size, 1);
+
+        size_t new_size = (flags & FORMAT_APPEND) ? checked_add(length, _size) : _size;
+        if (flags & FORMAT_GROW) {
+            new_size = growth_capacity(size, new_size);
         }
-        return (length = sw_snprintf(str, size, format, args...));
+
+        size_t n;
+        if (flags & FORMAT_APPEND) {
+            if (_size > size - length) {
+                reserve(new_size);
+            }
+            n = sw_snprintf(str + length, size - length, format, args...);
+            length += n;
+        } else {
+            if (_size > size) {
+                reserve(new_size);
+            }
+            n = sw_snprintf(str, size, format, args...);
+            length = n;
+        }
+
+        return n;
+    }
+
+    // This function replaces the entire string instead of appending content.
+    template <typename... Args>
+    size_t format(const char *format, Args... args) {
+        return format_impl(0, format, args...);
+    }
+
+    template <typename... Args>
+    size_t append_format(const char *format, Args... args) {
+        return format_impl(FORMAT_APPEND, format, args...);
     }
 
     char *pop(size_t init_size);

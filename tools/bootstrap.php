@@ -8,13 +8,22 @@
  */
 
 define('ROOT_DIR', dirname(__DIR__));
-define('LIBRARY_DIR', ROOT_DIR . '/library');
-define('LIBRARY_SRC_DIR', LIBRARY_DIR . '/src');
+const LIBRARY_DIR = ROOT_DIR . '/library';
+const LIBRARY_SRC_DIR = LIBRARY_DIR . '/src';
 
-define('EMOJI_OK', '✅');
-define('EMOJI_SUCCESS', '🚀');
-define('EMOJI_ERROR', '❌');
-define('EMOJI_WARN', '⚠️');
+if (!defined('EMOJI_OK')) {
+    define('EMOJI_OK', '✅');
+}
+if (!defined('EMOJI_SUCCESS')) {
+    define('EMOJI_SUCCESS', '🚀');
+}
+if (!defined('EMOJI_ERROR')) {
+    define('EMOJI_ERROR', '❌');
+}
+if (!defined('EMOJI_WARN')) {
+    define('EMOJI_WARN', '⚠️');
+}
+
 define('SWOOLE_SOURCE_ROOT', dirname(__DIR__) . '/');
 
 if (!defined('SWOOLE_COLOR_RED')) {
@@ -106,7 +115,7 @@ function swoole_execute_and_check(array $commands): void
     echo "===========  Execute  ==============" . PHP_EOL;
     $command = implode(' ', $commands);
     exec($command, $output, $return_var);
-    if (substr($output[0] ?? '', 0, 2) === '#!') {
+    if (str_starts_with($output[0] ?? '', '#!')) {
         array_shift($output);
     }
     echo '> ' . implode("\n> ", $output) . "" . PHP_EOL;
@@ -116,14 +125,18 @@ function swoole_execute_and_check(array $commands): void
     echo "=========== Finish Done ============" . PHP_EOL . PHP_EOL;
 }
 
-function scan_dir(string $dir, callable $filter = null): array
+function scan_dir(string $dir, ?callable $filter = null): array
 {
-    $files = array_filter(scandir($dir), function (string $file) { return $file[0] !== '.'; });
-    array_walk($files, function (&$file) use ($dir) { $file = "{$dir}/{$file}"; });
+    $files = array_filter(scandir($dir), function (string $file) {
+        return $file[0] !== '.';
+    });
+    array_walk($files, function (&$file) use ($dir) {
+        $file = "{$dir}/{$file}";
+    });
     return array_values($filter ? array_filter($files, $filter) : $files);
 }
 
-function scan_dir_recursive(string $dir, callable $filter = null): array
+function scan_dir_recursive(string $dir, ?callable $filter = null): array
 {
     $result = [];
     $files = scan_dir($dir, $filter);
@@ -148,7 +161,7 @@ function file_size(string $filename, int $decimals = 2): string
 function swoole_git_files(): array
 {
     $root = SWOOLE_SOURCE_ROOT;
-    return explode(PHP_EOL, `cd {$root} && git ls-files`);
+    return explode(PHP_EOL, shell_exec("cd {$root} && git ls-files"));
 }
 
 function swoole_source_list(array $ext_list = [], array $excepts = []): array
@@ -163,7 +176,8 @@ function swoole_source_list(array $ext_list = [], array $excepts = []): array
         $excepts = $excepts + [
                 'core-tests',
                 'examples',
-                'thirdparty'
+                'tools',
+                'thirdparty',
             ];
         foreach ($excepts as $except) {
             if (preg_match("/{$except}/", $filename)) {
@@ -176,20 +190,4 @@ function swoole_source_list(array $ext_list = [], array $excepts = []): array
     sort($source_list);
 
     return $source_list;
-}
-
-function swoole_library_files()
-{
-    $files = [];
-
-    $file_spl_objects = new \RecursiveIteratorIterator(
-        new \RecursiveDirectoryIterator(LIBRARY_SRC_DIR, \RecursiveDirectoryIterator::SKIP_DOTS),
-        \RecursiveIteratorIterator::LEAVES_ONLY
-    );
-
-    foreach ($file_spl_objects as $full_file_name => $file_spl_object) {
-        $files[] = str_replace(LIBRARY_SRC_DIR . '/', '', $full_file_name);
-    }
-
-    return $files;
 }

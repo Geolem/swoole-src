@@ -1,6 +1,37 @@
 #include "test_coroutine.h"
 
 using namespace swoole;
+using swoole::coroutine::System;
+
+static_assert(!std::is_copy_constructible<swoole::coroutine::Context>::value, "A context exclusively owns its stack");
+static_assert(!std::is_move_constructible<swoole::coroutine::Context>::value, "A context address must remain stable");
+
+#ifndef SW_USE_THREAD_CONTEXT
+TEST(coroutine_context, owns_stack_through_suspend_and_completion) {
+    swoole::coroutine::Context *active_context = nullptr;
+    int stage = 0;
+    int argument = 42;
+    swoole::coroutine::Context context(
+        128 * 1024,
+        [&](void *data) {
+            EXPECT_EQ(data, &argument);
+            stage = 1;
+            EXPECT_TRUE(active_context->swap_out());
+            stage = 2;
+        },
+        &argument);
+    active_context = &context;
+    EXPECT_NE(context.get_stack(), nullptr);
+    EXPECT_EQ(context.get_stack_size(), 128u * 1024);
+    EXPECT_FALSE(context.is_end());
+    EXPECT_TRUE(context.swap_in());
+    EXPECT_EQ(stage, 1);
+    EXPECT_FALSE(context.is_end());
+    EXPECT_TRUE(context.swap_in());
+    EXPECT_EQ(stage, 2);
+    EXPECT_TRUE(context.is_end());
+}
+#endif
 
 TEST(coroutine_base, create) {
     long _cid;
@@ -33,18 +64,37 @@ TEST(coroutine_base, get_init_msec) {
 }
 
 TEST(coroutine_base, yield_resume) {
-    long _cid;
+    Coroutine::set_on_yield([](void *arg) {
+        auto task = static_cast<long *>(Coroutine::get_current_task());
+        ASSERT_NE(task, nullptr);
+        ASSERT_EQ(*task, Coroutine::get_current_cid());
+    });
+
+    Coroutine::set_on_resume([](void *arg) {
+        Coroutine *current = Coroutine::get_current();
+        ASSERT_EQ(current, nullptr);
+    });
+
+    Coroutine::set_on_close([](void *arg) {
+        auto task = static_cast<long *>(Coroutine::get_current_task());
+        ASSERT_NE(task, nullptr);
+        ASSERT_EQ(*task, Coroutine::get_current_cid());
+    });
+
+    long _cid, _cid2;
     long cid = Coroutine::create(
-        [](void *arg) {
-            long cid = Coroutine::get_current_cid();
-            Coroutine *co = Coroutine::get_by_cid(cid);
+        [&_cid2](void *arg) {
+            _cid2 = Coroutine::get_current_cid();
+            Coroutine *co = Coroutine::get_by_cid(_cid2);
+            co->set_task(&_cid2);
             co->yield();
-            *(long *) arg = Coroutine::get_current_cid();
+            *static_cast<long *>(arg) = Coroutine::get_current_cid();
         },
         &_cid);
 
     ASSERT_GT(cid, 0);
     Coroutine::get_by_cid(cid)->resume();
+    Coroutine::set_on_close(nullptr);
     ASSERT_EQ(cid, _cid);
 }
 
@@ -86,6 +136,85 @@ TEST(coroutine_base, get_origin_cid) {
     });
 }
 
+TEST(coroutine_base, expired_origin) {
+    Coroutine *child = nullptr;
+    long child_cid = 0;
+
+    Coroutine::create([&](void *arg) {
+        child_cid = Coroutine::create([](void *arg) { Coroutine::get_current()->yield(); });
+        child = Coroutine::get_by_cid(child_cid);
+    });
+
+    ASSERT_NE(nullptr, child);
+    ASSERT_EQ(nullptr, child->get_origin());
+    ASSERT_EQ(-1, child->get_origin_cid());
+
+    child->resume();
+    ASSERT_EQ(nullptr, Coroutine::get_by_cid(child_cid));
+}
+
+TEST(coroutine_base, tree_exit_any_order) {
+    /*
+     * A -> B -> C and A -> D -> E, then close the coroutines in every possible order.
+     * After each close, the origin of every surviving coroutine must be nullptr
+     * or point to a coroutine that is still alive (address present in the map).
+     */
+    std::vector<long> cid(5);
+
+    auto build_tree = [&cid]() {
+        cid[0] = Coroutine::create([&cid](void *) {      // A
+            cid[1] = Coroutine::create([&cid](void *) {  // B
+                cid[2] = Coroutine::create([](void *) {  // C
+                    Coroutine::get_current()->yield();
+                });
+                Coroutine::get_current()->yield();
+            });
+            cid[3] = Coroutine::create([&cid](void *) {  // D
+                cid[4] = Coroutine::create([](void *) {  // E
+                    Coroutine::get_current()->yield();
+                });
+                Coroutine::get_current()->yield();
+            });
+            Coroutine::get_current()->yield();
+        });
+    };
+
+    auto assert_no_dangling_origin = [&cid]() {
+        for (long i : cid) {
+            Coroutine *co = Coroutine::get_by_cid(i);
+            if (co == nullptr) {
+                continue;
+            }
+            Coroutine *origin = co->get_origin();
+            bool alive = (origin == nullptr);
+            for (long j : cid) {
+                if (Coroutine::get_by_cid(j) == origin) {
+                    alive = true;
+                    break;
+                }
+            }
+            EXPECT_TRUE(alive) << "cid=" << i << " holds a dangling origin=" << origin;
+        }
+    };
+
+    std::vector<long> order = {0, 1, 2, 3, 4};
+    size_t tested = 0;
+    do {
+        build_tree();
+        ASSERT_EQ(5, (int) Coroutine::count());
+        for (long i : order) {
+            Coroutine *co = Coroutine::get_by_cid(cid[i]);
+            ASSERT_NE(nullptr, co);
+            co->resume();
+            ASSERT_EQ(nullptr, Coroutine::get_by_cid(cid[i]));
+            assert_no_dangling_origin();
+        }
+        ASSERT_EQ(0, (int) Coroutine::count());
+        tested++;
+    } while (std::next_permutation(order.begin(), order.end()));
+    ASSERT_EQ(120, (int) tested);
+}
+
 TEST(coroutine_base, is_end) {
     Coroutine::create([](void *_arg) {
         auto co = Coroutine::get_current();
@@ -118,6 +247,7 @@ TEST(coroutine_base, get_current_cid) {
         auto co = Coroutine::get_current();
         auto actual = co->get_cid();
         ASSERT_EQ(actual, Coroutine::get_current_cid());
+        ASSERT_EQ(actual, swoole_coroutine_get_id());
     });
 }
 
@@ -173,8 +303,169 @@ TEST(coroutine_base, get_elapsed) {
 }
 
 TEST(coroutine_base, run) {
-    long cid = coroutine::run([](void *ptr){
+    long cid = coroutine::run([](void *ptr) {
 
     });
     ASSERT_GE(cid, 1);
+}
+
+TEST(coroutine_base, cancel) {
+    coroutine::run([](void *arg) {
+        auto co = Coroutine::get_current_safe();
+        Coroutine::create([co](void *) {
+            System::sleep(0.002);
+            co->cancel();
+        });
+        ASSERT_EQ(co->yield_ex(-1), false);
+        ASSERT_EQ(co->is_canceled(), true);
+    });
+}
+
+TEST(coroutine_base, noncancelable) {
+    std::unordered_map<std::string, bool> flags;
+    coroutine::run([&flags](void *arg) {
+        auto cid = Coroutine::create([&flags](void *_arg) {
+            Coroutine *current = Coroutine::get_current();
+            flags["yield_1"] = true;
+            current->yield();
+            ASSERT_FALSE(current->is_canceled());
+
+            flags["yield_2"] = true;
+            current->yield_ex(-1);
+            ASSERT_TRUE(current->is_canceled());
+        });
+
+        auto co = Coroutine::get_by_cid(cid);
+
+        flags["cancel_1"] = true;
+        ASSERT_FALSE(co->cancel());
+        ASSERT_EQ(swoole_get_last_error(), SW_ERROR_CO_CANNOT_CANCEL);
+        flags["resume_1"] = true;
+        co->resume();
+
+        flags["cancel_2"] = true;
+        ASSERT_TRUE(co->cancel());
+        flags["resume_2"] = true;
+
+        flags["done"] = true;
+    });
+
+    ASSERT_TRUE(flags["yield_1"]);
+    ASSERT_TRUE(flags["yield_2"]);
+    ASSERT_TRUE(flags["cancel_1"]);
+    ASSERT_TRUE(flags["resume_1"]);
+    ASSERT_TRUE(flags["cancel_2"]);
+    ASSERT_TRUE(flags["resume_2"]);
+    ASSERT_TRUE(flags["done"]);
+}
+
+TEST(coroutine_base, timeout) {
+    coroutine::run([](void *arg) {
+        auto co = Coroutine::get_current_safe();
+        ASSERT_EQ(co->yield_ex(0.005), false);
+        ASSERT_EQ(co->is_timedout(), true);
+    });
+}
+
+TEST(coroutine_base, gdb) {
+    Coroutine::create([](void *) {
+        Coroutine *current = Coroutine::get_current();
+        long cid = current->get_cid();
+        ASSERT_EQ(swoole_coroutine_count(), 1);
+        ASSERT_EQ(swoole_coroutine_get(cid), current);
+        ASSERT_EQ(swoole_coroutine_get(999999), nullptr);
+
+        swoole_coroutine_iterator_reset();
+        ASSERT_EQ(swoole_coroutine_iterator_each(), current);
+        ASSERT_EQ(swoole_coroutine_iterator_each(), nullptr);
+
+        swoole_coroutine_iterator_reset();
+        ASSERT_EQ(swoole_coroutine_iterator_each(), current);
+        Coroutine::print_list();
+    });
+}
+
+TEST(coroutine_base, bailout) {
+    int status;
+
+    status = test::spawn_exec_and_wait([]() {
+        std::unordered_map<std::string, bool> flags;
+        coroutine::run([&flags](void *arg) {
+            Coroutine::create([&flags](void *_arg) {
+                Coroutine *current = Coroutine::get_current();
+                current->bailout([&flags]() { flags["exit"] = true; });
+                flags["end"] = true;
+            });
+        });
+
+        ASSERT_TRUE(flags["exit"]);
+        ASSERT_FALSE(flags["end"]);
+    });
+    ASSERT_EQ(status, 0);
+
+    status = test::spawn_exec_and_wait([]() {
+        std::unordered_map<std::string, bool> flags;
+        coroutine::run([&flags](void *arg) {
+            Coroutine *current = Coroutine::get_current();
+            current->bailout(nullptr);
+            flags["end"] = true;
+        });
+
+        ASSERT_TRUE(flags["exit"]);
+        ASSERT_FALSE(flags["end"]);
+    });
+    ASSERT_EQ(WEXITSTATUS(status), 1);
+
+    status = test::spawn_exec_and_wait([]() {
+        std::unordered_map<std::string, bool> flags;
+        coroutine::run([&flags](void *arg) {
+            Coroutine *current = Coroutine::get_current();
+            swoole_event_defer(
+                [current, &flags](void *args) {
+                    flags["bailout"] = true;
+                    current->bailout(nullptr);
+                    flags["end"] = true;
+                },
+                nullptr);
+            flags["exit"] = true;
+        });
+
+        ASSERT_TRUE(flags["exit"]);
+        ASSERT_TRUE(flags["end"]);
+    });
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(coroutine_base, undefined_behavior) {
+    int status;
+    status = test::spawn_exec_and_wait([]() { test::coroutine::run([](void *) { swoole_fork(0); }); });
+    ASSERT_EQ(1, WEXITSTATUS(status));
+
+    status = test::spawn_exec_and_wait([]() {
+        std::atomic<int> handle_count(0);
+        AsyncEvent event = {};
+        event.object = &handle_count;
+        event.callback = [](AsyncEvent *event) {};
+        event.handler = [](AsyncEvent *event) { ++(*static_cast<std::atomic<int> *>(event->object)); };
+
+        swoole_event_init(0);
+        auto ret = async::dispatch(&event);
+        ASSERT_NE(ret, nullptr);
+        swoole_fork(0);
+    });
+    ASSERT_EQ(1, WEXITSTATUS(status));
+
+    ASSERT_EQ(0, swoole_fork(SW_FORK_PRECHECK));
+}
+
+TEST(coroutine_base, c_api) {
+    int code = 0x9501;
+    auto c1 = swoole_coroutine_create(
+        [](void *_arg) {
+            ASSERT_EQ(*(int *) _arg, 0x9501);
+            swoole_coroutine_create([](void *_arg) { swoole_coroutine_usleep(100000); }, nullptr);
+        },
+        &code);
+
+    ASSERT_GE(c1, 1);
 }

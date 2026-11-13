@@ -15,11 +15,16 @@ $pm->parentFunc = function () use ($pm) {
 };
 
 $pm->childFunc = function () use ($pm) {
-    $http = new swoole_http_server('0.0.0.0', $pm->getFreePort(), SWOOLE_BASE);
+    $http = new Swoole\Http\Server('0.0.0.0', $pm->getFreePort(), SWOOLE_BASE);
     $http->set([
         'worker_num' => 1,
         'log_file' => '/dev/null'
     ]);
+    $http->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $http->on('request', 'var_dump');
     $http->start();
 };
@@ -40,8 +45,10 @@ object(Swoole\Http\Request)#%d (%d) {
     ["accept-encoding"]=>
     string(%d) "%s"
   }
+  ["trailer"]=>
+  NULL
   ["server"]=>
-  array(10) {
+  array(11) {
     ["request_method"]=>
     string(3) "GET"
     ["request_uri"]=>
@@ -58,6 +65,8 @@ object(Swoole\Http\Request)#%d (%d) {
     int(%d)
     ["remote_port"]=>
     int(%d)
+    ["server_addr"]=>
+    string(9) "127.0.0.1"
     ["remote_addr"]=>
     string(9) "127.0.0.1"
     ["master_time"]=>

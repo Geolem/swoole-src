@@ -19,7 +19,7 @@ function test($port) {
         $http = "GET / HTTP/1.0\r\nAccept: */*User-Agent: Lowell-Agent\r\nHost: www.baidu.com\r\nConnection: Close\r\n\r\n";
         fwrite($fp, $http);
         $content = fread($fp, 1024);
-        Assert::isEmpty($content);
+        Assert::false($content);
         $res = stream_get_meta_data($fp);
         Assert::false($res['eof']);
         Assert::true($res['blocked']);
@@ -45,10 +45,10 @@ $pm->childFunc = function () use ($pm) {
         "worker_num" => 1,
         'log_file' => '/dev/null',
     ]);
-    $serv->on("WorkerStart", function (\swoole_server $serv) use ($pm) {
+    $serv->on("WorkerStart", function (Swoole\Server $serv) use ($pm) {
         $pm->wakeup();
     });
-    $serv->on("Receive", function (\swoole_server $serv, $fd, $rid, $data) {
+    $serv->on("Receive", function (Swoole\Server $serv, $fd, $rid, $data) {
         //donot send any
     });
     $serv->start();

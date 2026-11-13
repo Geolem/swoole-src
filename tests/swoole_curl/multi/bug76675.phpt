@@ -1,13 +1,15 @@
 --TEST--
-Bug #76675 (Segfault with H2 server push write/writeheader handlers)
+swoole_curl/multi: Bug #76675 (Segfault with H2 server push write/writeheader handlers)
 --SKIPIF--
 <?php
-if (getenv("SKIP_ONLINE_TESTS")) {
-    die("skip online test");
+require __DIR__ . '/../../include/skipif.inc';
+skip_if_no_database();
+if (getenv('SKIP_ONLINE_TESTS')) {
+    exit('skip online test');
 }
 $curl_version = curl_version();
-if ($curl_version['version_number'] < 0x073d00) {
-    exit("skip: test may crash with curl < 7.61.0");
+if ($curl_version['version_number'] < 0x080100) {
+    exit("skip: test may crash with curl < 8.1.0\n");
 }
 ?>
 --FILE--
@@ -17,11 +19,11 @@ use Swoole\Runtime;
 
 use function Swoole\Coroutine\run;
 
-$fn = function() {
+$fn = function () {
     $transfers = 1;
-    $callback = function($parent, $passed) use (&$transfers) {
+    $callback = function ($parent, $passed) use (&$transfers) {
         curl_setopt($passed, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
-            echo "Received ".strlen($data);
+            echo 'Received ' . strlen($data);
             return strlen($data);
         });
         $transfers++;
@@ -31,7 +33,7 @@ $fn = function() {
     curl_multi_setopt($mh, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
     curl_multi_setopt($mh, CURLMOPT_PUSHFUNCTION, $callback);
     $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, 'https://http2.golang.org/serverpush');
+    curl_setopt($ch, CURLOPT_URL, TEST_HTTP2_SERVERPUSH_URL);
     curl_setopt($ch, CURLOPT_HTTP_VERSION, 3);
     curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
@@ -40,10 +42,11 @@ $fn = function() {
     $active = null;
     do {
         $status = curl_multi_exec($mh, $active);
-        // echo "active=$active, status=$status\n";
+        phpt_echo("active={$active}, status={$status}\n");
         do {
             $info = curl_multi_info_read($mh);
-            if (false !== $info && $info['msg'] == CURLMSG_DONE) {
+            phpt_echo($info);
+            if ($info !== false && $info['msg'] == CURLMSG_DONE) {
                 $handle = $info['handle'];
                 if ($handle !== null) {
                     $transfers--;
@@ -52,6 +55,7 @@ $fn = function() {
                 }
             }
         } while ($info);
+        curl_multi_select($mh);
     } while ($transfers);
     curl_multi_close($mh);
 };

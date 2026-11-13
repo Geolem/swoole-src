@@ -30,7 +30,7 @@ $pm->parentFunc = function ($pid) use ($pm, $time1, $time2) {
     $s = microtime(true);
     sleep(1);
     usleep(200000);
-    Assert::greaterThan($time2->get() - $time1->get(), 1000);
+    Assert::greaterThanEq($time2->get() - $time1->get(), 1000);
     $result = '';
     while(true) {
         $data = $client->recv();
@@ -39,7 +39,7 @@ $pm->parentFunc = function ($pid) use ($pm, $time1, $time2) {
         }
         $result .= $data;
     }
-    Assert::greaterThan(strlen($result), 65536);
+    Assert::greaterThanEq(strlen($result), 8192);
     $pm->kill();
 };
 

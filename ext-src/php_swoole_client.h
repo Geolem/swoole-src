@@ -12,7 +12,7 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
@@ -21,7 +21,53 @@
 #include "php_swoole_cxx.h"
 #include "swoole_client.h"
 
-bool php_swoole_client_check_setting(swoole::network::Client *cli, zval *zset);
-#ifdef SW_USE_OPENSSL
-void php_swoole_client_check_ssl_setting(swoole::network::Client *cli, zval *zset);
+enum ClientFlag {
+    SW_FLAG_KEEP = 1u << 12,
+    SW_FLAG_ASYNC = 1u << 10,
+    SW_FLAG_SYNC = 1u << 11,
+};
+
+struct AsyncClientObject {
+    zend::Callable *onConnect;
+    zend::Callable *onReceive;
+    zend::Callable *onClose;
+    zend::Callable *onError;
+    zend::Callable *onBufferFull;
+    zend::Callable *onBufferEmpty;
+    zend::Callable *onSSLReady;
+    zval _zobject;
+};
+
+typedef swoole::network::Client NetClient;
+
+struct ClientObject {
+    NetClient *cli;
+#ifdef SWOOLE_SOCKETS_SUPPORT
+    zval *zsocket;
 #endif
+    AsyncClientObject *async;
+    zend_object std;
+};
+
+static inline ClientObject *php_swoole_client_fetch_object(zend_object *obj) {
+    return reinterpret_cast<ClientObject *>(reinterpret_cast<char *>(obj) - swoole_client_handlers.offset);
+}
+
+static inline ClientObject *php_swoole_client_fetch_object(const zval *zobj) {
+    return php_swoole_client_fetch_object(Z_OBJ_P(zobj));
+}
+
+static inline NetClient *php_swoole_client_get_cli(const zval *zobject) {
+    return php_swoole_client_fetch_object(Z_OBJ_P(zobject))->cli;
+}
+
+static inline enum swSocketType php_swoole_client_get_type(long type) {
+    return (enum swSocketType)(type & (~SW_FLAG_SYNC) & (~SW_FLAG_ASYNC) & (~SW_FLAG_KEEP) & (~SW_SOCK_SSL));
+}
+
+NetClient *php_swoole_client_get_cli_safe(const zval *zobject);
+void php_swoole_client_free(const zval *zobject, NetClient *cli);
+void php_swoole_client_async_free_object(const ClientObject *client_obj);
+bool php_swoole_client_check_setting(NetClient *cli, const zval *zset);
+void php_swoole_client_check_ssl_setting(const NetClient *cli, const zval *zset);
+bool php_swoole_client_enable_ssl_encryption(NetClient *cli, zval *zobject);

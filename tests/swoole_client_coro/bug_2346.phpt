@@ -29,17 +29,22 @@ $pm->parentFunc = function () use ($pm) {
                 $client->close();
             });
             Assert::assert(@!$client->recv(-1)); // connection closed
-            Assert::same($client->errCode, SOCKET_ECONNRESET);
+            Assert::same($client->errCode, SOCKET_ECANCELED);
             approximate(0.5, microtime(true) - $s);
             // canceled
             echo "DONE\n";
         }
     });
-    swoole_event_wait();
+    Swoole\Event::wait();
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
     $server = new Swoole\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE, SWOOLE_SOCK_TCP);
+    $server->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $server->on('receive', function () { });
     $server->start();
 };

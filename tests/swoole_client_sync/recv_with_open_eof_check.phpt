@@ -22,19 +22,24 @@ $pm->parentFunc = function () use ($pm) {
 
     $data = @$client->recv(1024 * 1024 * 2);
     Assert::false($data);
-    Assert::eq(11, $client->errCode);
+    Assert::eq(SOCKET_EAGAIN, $client->errCode);
     $client->close();
     $pm->kill();
     echo "DONE\n";
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new Server("127.0.0.1", $pm->getFreePort());
+    $serv = new Server("127.0.0.1", $pm->getFreePort(), SWOOLE_PROCESS);
 
     $serv->set([
         "worker_num" => 1,
         'log_file' => '/dev/null',
     ]);
 
+    $serv->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $serv->on('receive', function (Server $serv, $fd, $reactor_id, $data) {
     });
 

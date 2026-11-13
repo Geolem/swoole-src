@@ -1,11 +1,14 @@
 --TEST--
 swoole_timer: #2697
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_class_not_exist(Swoole\Server::class);
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
-$server = new Swoole\Server('127.0.0.1', get_one_free_port());
+$server = new Swoole\Server('127.0.0.1', get_one_free_port(), SWOOLE_PROCESS);
 $server->set(['log_file' => '/dev/null']);
 $server->on('workerStart', function (Swoole\Server $server, int $worker_id) {
     Swoole\Timer::after(1000, function () {
@@ -16,7 +19,7 @@ $server->on('workerStart', function (Swoole\Server $server, int $worker_id) {
     });
     Swoole\Timer::clearAll();
     if ($worker_id === 0) {
-        Swoole\Timer::after(10, function () use ($server) {
+        Swoole\Timer::after(200, function () use ($server) {
             $server->shutdown();
         });
     }

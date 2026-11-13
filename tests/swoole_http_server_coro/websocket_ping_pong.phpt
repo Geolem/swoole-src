@@ -14,7 +14,12 @@ $pm = new ProcessManager;
 $pm->parentFunc = function () use ($pm) {
     go(function () use ($pm) {
         $cli = new Client('127.0.0.1', $pm->getFreePort());
-        $cli->set(['timeout' => 5]);
+        $cli->set([
+            'timeout' => 5,
+            'open_websocket_ping_frame' => true,
+            'open_websocket_pong_frame' => true,
+            'open_websocket_close_frame' => true,
+        ]);
         $ret = $cli->upgrade('/websocket');
         Assert::assert($ret);
         $cli->push('Swoole');
@@ -29,12 +34,17 @@ $pm->parentFunc = function () use ($pm) {
         $ret = $cli->recv();
         Assert::same($ret->opcode, WEBSOCKET_OPCODE_PONG);
     });
-    swoole_event_wait();
+    Swoole\Event::wait();
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
     go(function () use ($pm) {
         $server = new Server("127.0.0.1", $pm->getFreePort(), false);
+        $server->set([
+            'open_websocket_ping_frame' => true,
+            'open_websocket_pong_frame' => true,
+            'open_websocket_close_frame' => true,
+        ]);
         $server->handle('/websocket', function ($request, $ws) {
             $ws->upgrade();
             while (true) {
@@ -59,10 +69,10 @@ $pm->childFunc = function () use ($pm) {
                 }
             }
         });
-        $server->start();
         $pm->wakeup();
+        $server->start();
     });
-    swoole_event_wait();
+    Swoole\Event::wait();
 };
 $pm->childFirst();
 $pm->run();

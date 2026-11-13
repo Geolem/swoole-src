@@ -1,14 +1,17 @@
 --TEST--
 swoole_timer: reinit [2]
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_class_not_exist(Swoole\Server::class);
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
 use Swoole\Timer;
 
-const RES_FILE = __DIR__ . '/result.txt';
+const RES_FILE = __DIR__ . '/reinit_2.result';
 file_put_contents(RES_FILE, "");
 
 $pm = new ProcessManager;

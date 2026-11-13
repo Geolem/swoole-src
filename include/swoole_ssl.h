@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -18,21 +18,18 @@
 
 #include "swoole.h"
 
-#ifdef SW_USE_OPENSSL
-
 #include <unordered_map>
 #include <string>
-#include <array>
 
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
-#include <openssl/conf.h>
-#include <openssl/ossl_typ.h>
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/rand.h>
+#include <openssl/conf.h>
+#include <openssl/opensslv.h>
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
 #define SW_SUPPORT_DTLS
@@ -42,18 +39,26 @@
 #undef SW_SUPPORT_DTLS
 #endif
 
-enum swSSL_create_flag {
+#ifdef OPENSSL_IS_BORINGSSL
+#define BIO_CTRL_DGRAM_SET_CONNECTED 32
+#define BIO_CTRL_DGRAM_SET_PEER 44
+#define BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT 45
+#define BIO_dgram_get_peer(b, peer) (int) BIO_ctrl(b, BIO_CTRL_DGRAM_GET_PEER, 0, (char *) (peer))
+#define OPENSSL_assert(x) assert(x)
+#endif
+
+enum swSSLCreateFlag {
     SW_SSL_SERVER = 1,
     SW_SSL_CLIENT = 2,
 };
 
-enum swSSL_state {
+enum swSSLState {
     SW_SSL_STATE_HANDSHAKE = 0,
     SW_SSL_STATE_READY = 1,
     SW_SSL_STATE_WAIT_STREAM = 2,
 };
 
-enum swSSL_version {
+enum swSSLVersion {
     SW_SSL_SSLv2 = 1u << 1,
     SW_SSL_SSLv3 = 1u << 2,
     SW_SSL_TLSv1 = 1u << 3,
@@ -65,7 +70,7 @@ enum swSSL_version {
 
 #define SW_SSL_ALL (SW_SSL_SSLv2 | SW_SSL_SSLv3 | SW_SSL_TLSv1 | SW_SSL_TLSv1_1 | SW_SSL_TLSv1_2 | SW_SSL_TLSv1_3)
 
-enum swSSL_method {
+enum swSSLMethod {
     SW_SSLv23_METHOD = 0,
     SW_SSLv3_METHOD,
     SW_SSLv3_SERVER_METHOD,
@@ -112,21 +117,27 @@ struct SSLContext {
     uchar disable_tls_host_name : 1;
     std::string tls_host_name;
 #endif
+
+#ifdef OPENSSL_IS_BORINGSSL
+    uint8_t grease;
+#endif
+
     std::string cafile;
     std::string capath;
     uint8_t verify_depth;
     uchar disable_compress : 1;
     uchar verify_peer : 1;
+    // -1 preserves the existing peer verification policy; 0/1 explicitly control name verification.
+    int8_t verify_host = -1;
     uchar allow_self_signed : 1;
     uint32_t protocols;
-    uint8_t create_flag;
-    SSL_CTX *context;
+    SSL_CTX *context = nullptr;
 
-    SSL_CTX *get_context() {
+    SSL_CTX *get_context() const {
         return context;
     }
 
-    bool ready() {
+    bool ready() const {
         return context != nullptr;
     }
 
@@ -136,7 +147,7 @@ struct SSLContext {
 
     bool set_cert_file(const std::string &_cert_file) {
         if (access(_cert_file.c_str(), R_OK) < 0) {
-            swWarn("ssl cert file[%s] not found", _cert_file.c_str());
+            swoole_warning("ssl cert file[%s] not found", _cert_file.c_str());
             return false;
         }
         cert_file = _cert_file;
@@ -145,28 +156,37 @@ struct SSLContext {
 
     bool set_key_file(const std::string &_key_file) {
         if (access(_key_file.c_str(), R_OK) < 0) {
-            swWarn("ssl key file[%s] not found", _key_file.c_str());
+            swoole_warning("ssl key file[%s] not found", _key_file.c_str());
             return false;
         }
         key_file = _key_file;
         return true;
     }
 
-    bool create();
-    bool set_capath();
-    bool set_ciphers();
-    bool set_client_certificate();
-    bool set_ecdh_curve();
-    bool set_dhparam();
+    bool set_client_cert_file(const std::string &file) {
+        if (access(file.c_str(), R_OK) < 0) {
+            swoole_warning("ssl client cert file[%s] not found", file.c_str());
+            return false;
+        }
+        client_cert_file = file;
+        return true;
+    }
+
+    bool create(int flags);
+    bool set_capath(int flags) const;
+    bool set_ciphers() const;
+    bool set_client_certificate() const;
+    bool set_ecdh_curve() const;
+    bool set_dhparam() const;
     ~SSLContext();
 };
-}
+}  // namespace swoole
 
-void swSSL_init(void);
-void swSSL_init_thread_safety();
-bool swSSL_is_thread_safety();
-void swSSL_server_http_advise(swoole::SSLContext &);
-const char *swSSL_get_error();
-int swSSL_get_ex_connection_index();
-int swSSL_get_ex_port_index();
-#endif
+void swoole_ssl_init();
+void swoole_ssl_destroy();
+void swoole_ssl_lock_callback(int mode, int type, const char *file, int line);
+void swoole_ssl_server_http_advise(swoole::SSLContext &);
+const char *swoole_ssl_get_error();
+int swoole_ssl_get_ex_connection_index();
+int swoole_ssl_get_ex_port_index();
+std::string swoole_ssl_get_version_message();

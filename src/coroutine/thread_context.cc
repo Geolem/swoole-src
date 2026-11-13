@@ -10,11 +10,11 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_api.h"
+#include "swoole_signal.h"
 #include "swoole_async.h"
 #include "swoole_coroutine_context.h"
 
@@ -32,9 +32,13 @@ static std::mutex *current_lock = nullptr;
 
 void thread_context_init() {
     if (!swoole_timer_is_available()) {
-        swoole_timer_add(1, false, [](Timer *timer, TimerNode *tnode) {
-            // do nothing
-        }, nullptr);
+        swoole_timer_add(
+            1L,
+            false,
+            [](Timer *timer, TimerNode *tnode) {
+                // do nothing
+            },
+            nullptr);
     }
     if (SwooleTG.async_threads == nullptr) {
         SwooleTG.async_threads = new AsyncThreads();
@@ -56,8 +60,8 @@ void thread_context_clean() {
     g_lock.unlock();
 }
 
-Context::Context(size_t stack_size, const coroutine_func_t &fn, void *private_data)
-    : fn_(fn), private_data_(private_data) {
+Context::Context(size_t stack_size, CoroutineFunc fn, void *private_data)
+    : fn_(std::move(fn)), private_data_(private_data) {
     end_ = false;
     lock_.lock();
     swap_lock_ = nullptr;
@@ -83,7 +87,8 @@ bool Context::swap_out() {
     return true;
 }
 
-void Context::context_func(void *arg) {
+void Context::context_func(coroutine_transfer_t arg) {
+    swoole_signal_block_all();
     Context *_this = (Context *) arg;
     SwooleTG.reactor = g_reactor;
     SwooleTG.timer = g_timer;

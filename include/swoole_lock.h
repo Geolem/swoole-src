@@ -10,100 +10,157 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_memory.h"
 
+#ifndef _WIN32
+#include <sys/file.h>
+#else
+#include <windows.h>
+#endif
 #include <system_error>
 
 namespace swoole {
 
 class Lock {
   public:
+    Lock(const Lock &) = delete;
+    Lock &operator=(const Lock &) = delete;
     enum Type {
-        NONE,
         RW_LOCK = 1,
-        FILE_LOCK = 2,
         MUTEX = 3,
-        SEM = 4,
         SPIN_LOCK = 5,
-        ATOMIC_LOCK = 6,
+        COROUTINE_LOCK = 6,
     };
-    Type get_type() {
+    Type get_type() const {
         return type_;
     }
-    virtual ~Lock(){};
-    virtual int lock_rd() = 0;
-    virtual int lock() = 0;
+    virtual ~Lock() = default;
+    virtual int lock(int operation = LOCK_EX, int timeout_msec = -1) = 0;
     virtual int unlock() = 0;
-    virtual int trylock_rd() = 0;
-    virtual int trylock() = 0;
 
   protected:
-    Lock() {
-        type_ = NONE;
-        shared_ = false;
+    Lock(Type type, bool shared) {
+        type_ = type;
+        shared_ = shared;
     }
-    enum Type type_;
+    template <typename T>
+    void free_ptr(T *ptr) {
+        if (shared_) {
+            sw_mem_pool()->free((void *) ptr);
+        } else {
+            delete ptr;
+        }
+    }
+    Type type_;
     bool shared_;
 };
 
 struct MutexImpl;
 
-class Mutex : public Lock {
+class LockGuard {
+    Lock &lock_;
+    int error_;
+
+  public:
+    explicit LockGuard(Lock &lock, int operation = LOCK_EX, int timeout_msec = -1)
+        : lock_(lock), error_(lock_.lock(operation, timeout_msec)) {}
+    ~LockGuard() {
+        if (owns_lock()) {
+            lock_.unlock();
+        }
+    }
+    LockGuard(const LockGuard &) = delete;
+    LockGuard &operator=(const LockGuard &) = delete;
+
+    bool owns_lock() const noexcept {
+        return error_ == 0;
+    }
+    int error() const noexcept {
+        return error_;
+    }
+};
+
+class Mutex final : public Lock {
     MutexImpl *impl;
 
   public:
-    enum Flag {
-        PROCESS_SHARED = 1,
-        ROBUST = 2,
-    };
-
-    Mutex(int flags);
-    ~Mutex();
-    int lock_rd() override;
-    int lock() override;
+    explicit Mutex(bool shared);
+    ~Mutex() override;
+    int lock(int operation = LOCK_EX, int timeout_msec = -1) override;
     int unlock() override;
-    int trylock_rd() override;
-    int trylock() override;
-    int lock_wait(int timeout_msec);
 };
 
 #ifdef HAVE_RWLOCK
 struct RWLockImpl;
 
-class RWLock : public Lock {
+class RWLock final : public Lock {
     RWLockImpl *impl;
 
   public:
-    RWLock(int use_in_process);
-    ~RWLock();
-    int lock_rd() override;
-    int lock() override;
+    explicit RWLock(bool shared);
+    ~RWLock() override;
+    int lock(int operation = LOCK_EX, int timeout_msec = -1) override;
     int unlock() override;
-    int trylock_rd() override;
-    int trylock() override;
+    int lock_rd() {
+        return lock(LOCK_SH);
+    }
+    int lock_wr() {
+        return lock(LOCK_EX);
+    }
 };
 #endif
 
 #ifdef HAVE_SPINLOCK
-class SpinLock : public Lock {
+class SpinLock final : public Lock {
     pthread_spinlock_t *impl;
 
   public:
-    SpinLock(int use_in_process);
-    ~SpinLock();
-    int lock_rd() override;
-    int lock() override;
+    explicit SpinLock(bool shared);
+    ~SpinLock() override;
+    int lock(int operation = LOCK_EX, int timeout_msec = -1) override;
     int unlock() override;
-    int trylock_rd() override;
-    int trylock() override;
 };
 #endif
+
+class CoroutineLock final : public Lock {
+    long cid = 0;
+    sw_atomic_t *value = nullptr;
+    void *coroutine = nullptr;
+    int recursion_count = 0;
+
+    int lock_impl(bool blocking = true);
+
+  public:
+    explicit CoroutineLock(bool shared);
+    ~CoroutineLock() override;
+    int lock(int operation = LOCK_EX, int timeout_msec = -1) override;
+    int unlock() override;
+};
+
+#if defined(HAVE_PTHREAD_BARRIER) && !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__))
+#define SW_USE_PTHREAD_BARRIER
+#endif
+
+struct Barrier {
+#ifdef SW_USE_PTHREAD_BARRIER
+    pthread_barrier_t barrier_;
+    pthread_barrierattr_t barrier_attr_;
+    bool shared_;
+#else
+    sw_atomic_t count_;
+    sw_atomic_t barrier_;
+    sw_atomic_t generation_;
+#endif
+    void init(bool shared, int count);
+    void wait();
+    void destroy();
+};
+
 }  // namespace swoole

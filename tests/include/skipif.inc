@@ -8,11 +8,6 @@ define('SWOOLE_COLOR_CYAN', 6);
 define('SWOOLE_COLOR_WHITE', 7);
 
 skip(
-    'Linux only',
-    substr(PHP_OS, 0, 3) === 'WIN',
-    SWOOLE_COLOR_RED
-);
-skip(
     'Swoole extension is required',
     !extension_loaded('swoole'),
     SWOOLE_COLOR_RED
@@ -26,8 +21,8 @@ skip(
 (function () {
     global $argv;
     skip_if_php_version_lower_than('7.0');
-    if (!getenv('PHPT') && substr($argv[0], -4) === '.php') {
-        skip('please read ' . dirname(dirname(__FILE__)) . '/README.md and try again');
+    if (!getenv('PHPT') && str_ends_with($argv[0], '.php')) {
+        skip('please read ' . dirname(__FILE__, 2) . '/README.md and try again');
     }
     if (preg_match('#/(swoole_[^/]+)/#', $_SERVER['SCRIPT_FILENAME'], $dir)) {
         $dir = $dir[1];
@@ -45,13 +40,20 @@ function swoole_color(string $content, int $color): string
 function skip(string $reason, bool $is_skip = true, int $color = SWOOLE_COLOR_YELLOW)
 {
     if ($is_skip) {
-        exit('skip ' . swoole_color($reason, $color));
+        exit('skip ' . swoole_color($reason, $color) . "\n");
     }
 }
 
 function skip_if_php_version_lower_than($require_version = '7.0')
 {
     if (version_compare(PHP_VERSION, $require_version, '<')) {
+        skip('need php version >= ' . $require_version);
+    }
+}
+
+function skip_if_php_version_ge($require_version = '7.0')
+{
+    if (version_compare(PHP_VERSION, $require_version, '>=')) {
         skip('need php version >= ' . $require_version);
     }
 }
@@ -76,7 +78,14 @@ function skip_if_ini_bool_equal_to(string $name, bool $value)
     }
 }
 
-function skip_if_constant_not_defined(string $constant_name)
+function skip_if_no_nghttp(): void
+{
+    if (!str_contains(shell_exec("nghttp --version 2>&1"), 'nghttp2')) {
+        skip('no nghttp');
+    }
+}
+
+function skip_if_constant_not_defined(string $constant_name): void
 {
     require_once __DIR__ . '/config.php';
     skip("{$constant_name} is not defined", !defined($constant_name));
@@ -104,7 +113,7 @@ function skip_if_file_not_exist(string $filename)
 
 function skip_if_command_not_found(string $command)
 {
-    skip("command {$command} not found", empty(`{$command} --help 2>&1 | grep -i usage`));
+    skip("command {$command} not found", empty(shell_exec("{$command} --help 2>&1 | grep -i usage")));
 }
 
 function skip_if_no_ssl()
@@ -117,7 +126,7 @@ function skip_if_no_ssl()
 function skip_if_openssl_version_lower_than($version = '1.0.0')
 {
     skip_if_no_ssl();
-    $exist = preg_match('/openssl => openssl ([\d\.]+)/i', `php --ri swoole`, $match);
+    $exist = preg_match('/openssl => openssl ([\d\.]+)/i', shell_exec("php --ri swoole"), $match);
     assert($exist);
     if (version_compare($match[1], $version, '<')) {
         skip("openssl version {$match[1]} is lower than {$version}");
@@ -138,8 +147,8 @@ function skip_if_no_ipv6()
 function skip_if_no_top()
 {
     skip_if_darwin();
-    skip('top provided by busybox (not support)', !empty(`top --help 2>&1 | grep -i busybox`));
-    skip('no top', empty(`top help 2>&1 | grep -i usage`));
+    skip('top provided by busybox (not support)', !empty(shell_exec("top --help 2>&1 | grep -i busybox")));
+    skip('no top', empty(shell_exec("top help 2>&1 | grep -i usage")));
 }
 
 function skip_if_darwin()
@@ -147,9 +156,39 @@ function skip_if_darwin()
     skip('not support on darwin', stripos(PHP_OS, 'Darwin') !== false);
 }
 
+function skip_if_darwin_todo($msg = 'Need to review')
+{
+    skip($msg, getenv('MACOS_DEV') === false && stripos(PHP_OS, 'Darwin') !== false);
+}
+
+function skip_if_win()
+{
+    skip('not support on Windows', stripos(PHP_OS, 'WIN') === 0);
+}
+
+function skip_if_not_win()
+{
+    skip('only support Windows', stripos(PHP_OS, 'WIN') !== 0);
+}
+
+function skip_if_not_darwin()
+{
+    skip('only support darwin', stripos(PHP_OS, 'Darwin') === false);
+}
+
+function skip_if_nts()
+{
+    skip('thread support is required', !class_exists(Swoole\Thread::class, false));
+}
+
+function skip_if_not_linux()
+{
+    skip('only support linux', PHP_OS !== 'Linux');
+}
+
 function skip_if_musl_libc()
 {
-    skip('not support when use musl libc', !empty(`ldd 2>&1 | grep -i musl`));
+    skip('not support when use musl libc', !empty(shell_exec("ldd 2>&1 | grep -i musl")));
 }
 
 function skip_if_no_process_affinity()
@@ -162,9 +201,9 @@ function skip_if_in_valgrind(string $reason = 'valgrind is too slow')
     skip($reason, getenv('USE_ZEND_ALLOC') === '0');
 }
 
-function skip_if_in_travis(string $reason = 'not support in travis')
+function skip_if_in_ci(string $reason = 'not support in CI')
 {
-    skip($reason, file_exists('/.travisenv'));
+    skip($reason, !!getenv('GITHUB_ACTIONS') or file_exists('/.cienv'));
 }
 
 function skip_if_in_docker(string $reason = 'not support in docker')
@@ -198,6 +237,7 @@ function skip_if_no_socks5_proxy()
 
 function skip_if_pdo_not_support_mysql8()
 {
+    skip_if_no_database();
     require_once __DIR__ . '/config.php';
     try {
         new PDO(
@@ -211,8 +251,34 @@ function skip_if_pdo_not_support_mysql8()
     }
 }
 
+function skip_if_no_database()
+{
+    skip("no database", !!getenv('SWOOLE_CI_IN_MACOS'));
+}
+
+function skip_if_libpq_version_lower_than(int $major)
+{
+    $version = 0;
+    Swoole\Coroutine\run(function () use (&$version) {
+        $server = new Swoole\Coroutine\Socket(AF_INET, SOCK_STREAM, 0);
+        $server->bind('127.0.0.1', 0);
+        $server->listen();
+        Swoole\Coroutine::create(function () use ($server) {
+            $client = $server->accept();
+            $client->recv();
+            $client->sendAll("R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I");
+        });
+
+        $port = $server->getsockname()['port'];
+        $pdo = new PDO("pgsql:host=127.0.0.1;port={$port};dbname=test;sslmode=disable", 'user', 'pass');
+        $version = (int) $pdo->getAttribute(PDO::ATTR_CLIENT_VERSION);
+    });
+    skip("require libpq {$major} or later", $version < $major);
+}
+
 function skip_if_not_mysql8()
 {
+    skip_if_no_database();
     require_once __DIR__ . '/config.php';
     $skip = true;
     Swoole\Coroutine\run(function () use (&$skip) {
@@ -256,4 +322,29 @@ function skip_if_not_redis5()
 function skip_unsupported(string $message = '')
 {
     skip($message ?: 'the test cannot continue to work for some implementation reasons');
+}
+
+function skip_if_no_coroutine_get_execute_time()
+{
+    skip('no Swoole\Coroutine::getExecuteTime', !method_exists(Swoole\Coroutine::class, 'getExecuteTime'));
+}
+
+function skip_if_no_ftp()
+{
+    require_once __DIR__ . '/config.php';
+    skip('no available ftp server', !check_tcp_port(FTP_HOST, FTP_PORT));
+}
+
+function skip_if_not_root()
+{
+    skip('not root user', !function_exists('posix_geteuid') || posix_geteuid() !== 0);
+}
+
+function skip_if_no_iouring() {
+    skip('no io-uring supports', !defined('SWOOLE_IOURING_DEFAULT'));
+}
+
+function skip_if_not_defined(string $name)
+{
+    skip("`$name` is not defined", !defined($name));
 }

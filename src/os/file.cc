@@ -10,21 +10,35 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
 #include "swoole_file.h"
 
+#include <utility>
+
 int swoole_tmpfile(char *filename) {
-#if defined(HAVE_MKOSTEMP) && defined(HAVE_EPOLL)
+#if defined(_WIN32)
+    if (_mktemp_s(filename, strlen(filename) + 1) != 0) {
+        swoole_sys_warning("_mktemp_s('%s') failed", filename);
+        return SW_ERR;
+    }
+
+    // Use sw_open to create the temporary file with exclusive access
+    int tmp_fd = sw_open(filename, O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (tmp_fd < 0) {
+        swoole_sys_warning("sw_open('%s') failed", filename);
+        return SW_ERR;
+    }
+#elif defined(HAVE_MKOSTEMP) && defined(HAVE_EPOLL)
     int tmp_fd = mkostemp(filename, O_WRONLY | O_CREAT);
 #else
     int tmp_fd = mkstemp(filename);
 #endif
 
     if (tmp_fd < 0) {
-        swSysWarn("mkstemp(%s) failed", filename);
+        swoole_sys_warning("mkstemp('%s') failed", filename);
         return SW_ERR;
     } else {
         return tmp_fd;
@@ -40,7 +54,7 @@ ssize_t file_get_size(FILE *fp) {
 
 ssize_t file_get_size(const std::string &filename) {
     File file(filename, File::READ);
-    if (!file.ready()) {
+    if (sw_unlikely(!file.ready())) {
         swoole_set_last_error(errno);
         return -1;
     }
@@ -62,18 +76,18 @@ ssize_t file_get_size(int fd) {
 
 std::shared_ptr<String> file_get_contents(const std::string &filename) {
     File fp(filename, O_RDONLY);
-    if (!fp.ready()) {
-        swSysWarn("open(%s) failed", filename.c_str());
+    if (sw_unlikely(!fp.ready())) {
+        swoole_sys_warning("open('%s') failed", filename.c_str());
         return nullptr;
     }
 
     ssize_t filesize = fp.get_size();
-    if (filesize < 0) {
+    if (sw_unlikely(filesize < 0)) {
         return nullptr;
     } else if (filesize == 0) {
         swoole_error_log(SW_LOG_TRACE, SW_ERROR_FILE_EMPTY, "file[%s] is empty", filename.c_str());
         return nullptr;
-    } else if (filesize > SW_MAX_FILE_CONTENT) {
+    } else if (filesize > SwooleG.max_file_content) {
         swoole_error_log(SW_LOG_WARNING, SW_ERROR_FILE_TOO_LARGE, "file[%s] is too large", filename.c_str());
         return nullptr;
     }
@@ -87,33 +101,110 @@ std::shared_ptr<String> file_get_contents(const std::string &filename) {
 
 File make_tmpfile() {
     char *tmpfile = sw_tg_buffer()->str;
-    size_t l = swoole_strlcpy(tmpfile, SwooleG.task_tmpfile.c_str(), SW_TASK_TMP_PATH_SIZE);
+    size_t l = swoole_strlcpy(tmpfile, swoole_get_task_tmpdir().c_str(), SW_TASK_TMP_PATH_SIZE);
     int tmp_fd = swoole_tmpfile(tmpfile);
-    if (tmp_fd < 0) {
+    if (sw_unlikely(tmp_fd < 0)) {
         return File(-1);
     } else {
-        return File(tmp_fd, std::string(tmpfile, l));
+        return {tmp_fd, std::string(tmpfile, l)};
     }
 }
 
 bool file_put_contents(const std::string &filename, const char *content, size_t length) {
-    if (length <= 0) {
-        swoole_error_log(SW_LOG_TRACE, SW_ERROR_FILE_EMPTY, "content is empty");
+    if (length == 0) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_FILE_EMPTY, "content is empty");
         return false;
     }
-    if (length > SW_MAX_FILE_CONTENT) {
+    if (length > SwooleG.max_file_content) {
         swoole_error_log(SW_LOG_WARNING, SW_ERROR_FILE_TOO_LARGE, "content is too large");
         return false;
     }
     File file(filename, O_WRONLY | O_TRUNC | O_CREAT, 0666);
-    if (!file.ready()) {
-        swSysWarn("open(%s) failed", filename.c_str());
+    if (sw_unlikely(!file.ready())) {
+        swoole_sys_warning("open('%s') failed", filename.c_str());
         return false;
     }
     return file.write_all(content, length);
 }
 
-size_t File::write_all(const void *data, size_t len) {
+bool file_exists(const std::string &filename) {
+    return sw_access(filename.c_str(), F_OK) == 0;
+}
+
+File::File(const std::string &path, int oflags) : File(-1) {
+    open(path, oflags);
+}
+
+File::File(const std::string &path, int oflags, int mode) : File(-1) {
+    open(path, oflags, mode);
+}
+
+File::File(File &&other) noexcept
+    : fd_(std::exchange(other.fd_, -1)), flags_(std::exchange(other.flags_, 0)), path_(std::move(other.path_)) {}
+
+File &File::operator=(File &&other) noexcept {
+    if (this != &other) {
+        close();
+        fd_ = std::exchange(other.fd_, -1);
+        flags_ = std::exchange(other.flags_, 0);
+        path_ = std::move(other.path_);
+    }
+    return *this;
+}
+
+bool File::open(const std::string &path, int oflags, int mode) {
+    std::string new_path(path);
+    close();
+
+#ifdef _WIN32
+    fd_ = sw_open(new_path.c_str(), oflags, mode);
+#else
+    if (oflags & CREATE) {
+        fd_ = ::open(new_path.c_str(), oflags, mode == 0 ? 0644 : mode);
+    } else {
+        fd_ = ::open(new_path.c_str(), oflags);
+    }
+#endif
+
+    path_ = std::move(new_path);
+    flags_ = oflags;
+    return ready();
+}
+
+bool File::close() {
+    if (fd_ == -1) {
+        return false;
+    }
+    int tmp_fd = fd_;
+    fd_ = -1;
+    return sw_close_file(tmp_fd) == 0;
+}
+
+bool File::stat(FileStatus *_stat) const {
+    if (::fstat(fd_, _stat) < 0) {
+        swoole_sys_warning("fstat() failed");
+        return false;
+    }
+    return true;
+}
+
+File::~File() {
+    if (fd_ >= 0) {
+        sw_close_file(fd_);
+    }
+}
+
+static swReturnCode catch_fs_error(const ssize_t rv, const int error) {
+    if (rv == 0) {
+        return SW_CLOSE;
+    }
+    if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK) {
+        return SW_CONTINUE;
+    }
+    return SW_ERROR;
+}
+
+size_t File::write_all(const void *data, size_t len) const {
     size_t written_bytes = 0;
     while (written_bytes < len) {
         ssize_t n;
@@ -124,13 +215,12 @@ size_t File::write_all(const void *data, size_t len) {
         }
         if (n > 0) {
             written_bytes += n;
-        } else if (n == 0) {
-            break;
         } else {
-            if (errno == EINTR) {
+            const auto rc = catch_fs_error(n, errno);
+            if (rc == SW_ERROR) {
+                swoole_sys_warning("pwrite(%d, %p, %lu, %lu) failed", fd_, data, len - written_bytes, written_bytes);
+            } else if (rc == SW_CONTINUE) {
                 continue;
-            } else if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
-                swSysWarn("pwrite(%d, %p, %lu, %lu) failed", fd_, data, len - written_bytes, written_bytes);
             }
             break;
         }
@@ -138,19 +228,18 @@ size_t File::write_all(const void *data, size_t len) {
     return written_bytes;
 }
 
-size_t File::read_all(void *buf, size_t len) {
+size_t File::read_all(void *buf, size_t len) const {
     size_t read_bytes = 0;
     while (read_bytes < len) {
         ssize_t n = pread((char *) buf + read_bytes, len - read_bytes, read_bytes);
         if (n > 0) {
             read_bytes += n;
-        } else if (n == 0) {
-            break;
         } else {
-            if (errno == EINTR) {
+            const auto rc = catch_fs_error(n, errno);
+            if (rc == SW_ERROR) {
+                swoole_sys_warning("pread(%d, %p, %lu, %lu) failed", fd_, buf, len - read_bytes, read_bytes);
+            } else if (rc == SW_CONTINUE) {
                 continue;
-            } else if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
-                swSysWarn("pread(%d, %p, %lu, %lu) failed", fd_, buf, len - read_bytes, read_bytes);
             }
             break;
         }
@@ -158,18 +247,37 @@ size_t File::read_all(void *buf, size_t len) {
     return read_bytes;
 }
 
-std::shared_ptr<String> File::read_content() {
+ssize_t File::read_line(void *_buf, size_t _n) const {
+    if (sw_unlikely(_n <= 1)) {
+        return 0;
+    }
+    char *buf = (char *) _buf;
+    auto offset = get_offset();
+    ssize_t read_bytes = read(buf, _n - 1);
+    if (read_bytes <= 0) {
+        return read_bytes;
+    }
+    for (ssize_t i = 0; i < read_bytes; ++i) {
+        if (buf[i] == '\0' || buf[i] == '\n') {
+            buf[i + 1] = '\0';
+            set_offset(offset + i + 1);
+            return i + 1;
+        }
+    }
+    buf[read_bytes] = '\0';
+    set_offset(offset + read_bytes);
+    return read_bytes;
+}
+
+std::shared_ptr<String> File::read_content() const {
     ssize_t n = 0;
-    std::shared_ptr<String> data = std::make_shared<String>(SW_BUFFER_SIZE_STD);
-    while (1) {
+    auto data = std::make_shared<String>(SW_BUFFER_SIZE_STD);
+    while (true) {
         n = read(data->str + data->length, data->size - data->length);
         if (n <= 0) {
-            return data;
-        } else {
-            if (!data->grow((size_t) n)) {
-                return data;
-            }
+            break;
         }
+        data->grow((size_t) n);
     }
     return data;
 }

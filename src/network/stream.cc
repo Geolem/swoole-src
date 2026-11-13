@@ -10,15 +10,12 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
-#include "swoole.h"
-#include "swoole_api.h"
 #include "swoole_string.h"
 #include "swoole_socket.h"
-#include "swoole_reactor.h"
 #include "swoole_protocol.h"
 #include "swoole_client.h"
 
@@ -26,12 +23,12 @@ namespace swoole {
 namespace network {
 
 static void Stream_onConnect(Client *cli) {
-    Stream *stream = (Stream *) cli->object;
+    auto *stream = static_cast<Stream *>(cli->object);
     if (stream->cancel) {
         cli->close();
     }
-    *((uint32_t *) stream->buffer->str) = ntohl(stream->buffer->length - 4);
-    if (cli->send(cli, stream->buffer->str, stream->buffer->length, 0) < 0) {
+    *reinterpret_cast<uint32_t *>(stream->buffer->str) = ntohl(stream->buffer->length - 4);
+    if (cli->send(stream->buffer->str, stream->buffer->length, 0) < 0) {
         cli->close();
     } else {
         delete stream->buffer;
@@ -40,7 +37,7 @@ static void Stream_onConnect(Client *cli) {
 }
 
 static void Stream_onError(Client *cli) {
-    Stream *stream = (Stream *) cli->object;
+    auto *stream = static_cast<Stream *>(cli->object);
     stream->errCode = swoole_get_last_error();
 
     swoole_error_log(SW_LOG_WARNING,
@@ -57,8 +54,8 @@ static void Stream_onError(Client *cli) {
     delete stream;
 }
 
-static void Stream_onReceive(Client *cli, const char *data, uint32_t length) {
-    Stream *stream = (Stream *) cli->object;
+static void Stream_onReceive(Client *cli, const char *data, size_t length) {
+    auto *stream = static_cast<Stream *>(cli->object);
     if (length == 4) {
         cli->socket->close_wait = 1;
     } else {
@@ -69,13 +66,13 @@ static void Stream_onReceive(Client *cli, const char *data, uint32_t length) {
 static void Stream_onClose(Client *cli) {
     swoole_event_defer(
         [](void *data) {
-            Client *cli = (Client *) data;
-            delete (Stream *) cli->object;
+            const auto *cli = static_cast<Client *>(data);
+            delete static_cast<Stream *>(cli->object);
         },
         cli);
 }
 
-Stream::Stream(const char *dst_host, int dst_port, enum swSocket_type type) : client(type, true) {
+Stream::Stream(const char *dst_host, int dst_port, SocketType type) : client(type, true) {
     if (client.socket == nullptr) {
         return;
     }
@@ -86,20 +83,26 @@ Stream::Stream(const char *dst_host, int dst_port, enum swSocket_type type) : cl
     client.onClose = Stream_onClose;
     client.object = this;
 
-    client.open_length_check = 1;
+    client.open_length_check = true;
     set_protocol(&client.protocol);
 
-    if (client.connect(&client, dst_host, dst_port, -1, 0) < 0) {
-        swSysWarn("failed to connect to [%s:%d]", dst_host, dst_port);
+    if (client.connect(dst_host, dst_port, -1, 0) < 0) {
+        swoole_sys_warning("failed to connect to [%s:%d]", dst_host, dst_port);
         return;
     }
     connected = true;
 }
 
-Stream::~Stream() {
-    if (buffer) {
-        delete buffer;
+Stream *Stream::create(const char *dst_host, int dst_port, SocketType type) {
+    std::unique_ptr<Stream> stream(new Stream(dst_host, dst_port, type));
+    if (!stream->connected) {
+        return nullptr;
     }
+    return stream.release();
+}
+
+Stream::~Stream() {
+    delete buffer;
 }
 
 /**
@@ -107,8 +110,8 @@ Stream::~Stream() {
  */
 void Stream::set_protocol(Protocol *protocol) {
     protocol->get_package_length = Protocol::default_length_func;
-    protocol->package_length_size = 4;
     protocol->package_length_type = 'N';
+    protocol->package_length_size = swoole_type_size(protocol->package_length_type);
     protocol->package_body_offset = 4;
     protocol->package_length_offset = 0;
 }
@@ -118,36 +121,28 @@ void Stream::set_max_length(uint32_t max_length) {
 }
 
 int Stream::send(const char *data, size_t length) {
+    assert(data != nullptr);
+    assert(length > 0);
     if (buffer == nullptr) {
-        buffer = new String(swoole_size_align(length + 4, SwooleG.pagesize));
+        buffer = new String(swoole_size_align(length + 4, swoole_pagesize()));
         buffer->length = 4;
     }
-    if (buffer->append(data, length) < 0) {
-        return SW_ERR;
-    }
+    buffer->append(data, length);
     return SW_OK;
 }
 
-int Stream::recv_blocking(Socket *sock, void *__buf, size_t __len) {
+ssize_t Stream::recv_sync(Socket *sock, void *_buf, size_t _len) {
     int tmp = 0;
-    ssize_t ret = sock->recv_blocking(&tmp, sizeof(tmp), MSG_WAITALL);
-
-    if (ret <= 0) {
-        return SW_CLOSE;
+    ssize_t ret = sock->recv_sync(&tmp, sizeof(tmp), MSG_WAITALL);
+    if (ret != static_cast<ssize_t>(sizeof(tmp))) {
+        return SW_ERR;
     }
-    int length = (int) ntohl(tmp);
-    if (length <= 0) {
-        return SW_CLOSE;
-    } else if (length > (int) __len) {
-        return SW_CLOSE;
+    const int length = static_cast<int>(ntohl(tmp));
+    if (length <= 0 || length > static_cast<int>(_len)) {
+        return SW_ERR;
     }
-
-    ret = sock->recv_blocking(__buf, length, MSG_WAITALL);
-    if (ret <= 0) {
-        return SW_CLOSE;
-    } else {
-        return SW_READY;
-    }
+    ret = sock->recv_sync(_buf, length, MSG_WAITALL);
+    return ret == static_cast<ssize_t>(length) ? ret : SW_ERR;
 }
 
 }  // namespace network

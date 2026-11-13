@@ -1,11 +1,14 @@
 --TEST--
-curl_multi_close closed by cleanup functions
+swoole_curl/multi: curl_multi_close closed by cleanup functions
 --SKIPIF--
 <?php
+require __DIR__ . '/../../include/skipif.inc';
+skip_if_darwin_todo('curl multi cleanup with self-referenced arrays is unstable on macOS CI');
 if (!extension_loaded('curl')) print 'skip';
 ?>
 --FILE--
 <?php
+require __DIR__ . '/../../include/bootstrap.php';
 use Swoole\Runtime;
 
 use function Swoole\Coroutine\run;
@@ -20,8 +23,8 @@ run(function () {
     curl_multi_add_handle($mh, curl_init());
     curl_multi_add_handle($mh, curl_init());
     curl_multi_add_handle($mh, curl_init());
-    echo "okey";
+    echo "DONE\n";
 });
 ?>
 --EXPECT--
-okey
+DONE

@@ -17,7 +17,7 @@ $s = microtime(true);
 run(function () {
     $ch = curl_init();
     $code = uniqid('swoole_');
-    $url = "http://127.0.0.1:49494/?code=".urlencode($code);
+    $url = 'http://127.0.0.1:49494/?code=' . urlencode($code);
 
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
@@ -29,6 +29,8 @@ run(function () {
     $output = curl_exec($ch);
     Assert::isEmpty($output);
     Assert::eq(curl_errno($ch), CURLE_COULDNT_CONNECT);
+    // libcurl >= 8.17 prints "127.0.0.1:49494", older versions print "127.0.0.1 port 49494"
+    Assert::eq(preg_match('#Failed to connect to 127\.0\.0\.1[: ]+(port )?\d+#i', curl_error($ch)), 1);
 
     $info = curl_getinfo($ch);
     Assert::isArray($info);

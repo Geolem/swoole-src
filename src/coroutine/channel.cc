@@ -10,19 +10,32 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #include "swoole_coroutine_channel.h"
 
-#include <unordered_map>
-
 namespace swoole {
 namespace coroutine {
 
-void Channel::timer_callback(Timer *timer, TimerNode *tnode) {
-    TimeoutMessage *msg = (TimeoutMessage *) tnode->data;
+ChannelBase::TimeoutMessage::~TimeoutMessage() {
+    if (timer) {
+        swoole_timer_del(timer);
+    }
+}
+
+ChannelBase::~ChannelBase() {
+    if (sw_unlikely(!producer_queue.empty())) {
+        log_discarded("producers", producer_queue.size());
+    }
+    if (sw_unlikely(!consumer_queue.empty())) {
+        log_discarded("consumers", consumer_queue.size());
+    }
+}
+
+void ChannelBase::timer_callback(Timer *timer, TimerNode *tnode) {
+    auto *msg = static_cast<TimeoutMessage *>(tnode->data);
     msg->error = true;
     msg->timer = nullptr;
     if (msg->type == CONSUMER) {
@@ -33,105 +46,126 @@ void Channel::timer_callback(Timer *timer, TimerNode *tnode) {
     msg->co->resume();
 }
 
-void Channel::yield(enum opcode type) {
-    Coroutine *co = Coroutine::get_current_safe();
-    if (type == PRODUCER) {
-        producer_queue.push_back(co);
-        swTraceLog(SW_TRACE_CHANNEL, "producer cid=%ld", co->get_cid());
-    } else {
-        consumer_queue.push_back(co);
-        swTraceLog(SW_TRACE_CHANNEL, "consumer cid=%ld", co->get_cid());
+void ChannelBase::log_discarded(const char *type, size_t count) {
+    swoole_set_last_error(SW_ERROR_CO_HAS_BEEN_DISCARDED);
+    if (sw_unlikely(SW_LOG_WARNING >= swoole_get_log_level() &&
+                    !swoole_is_ignored_error(SW_ERROR_CO_HAS_BEEN_DISCARDED))) {
+        size_t len = sw_snprintf(sw_error,
+                                 SW_ERROR_MSG_SIZE,
+                                 "Channel::~Channel() (ERRNO %d): channel is destroyed, %zu %s will be discarded",
+                                 SW_ERROR_CO_HAS_BEEN_DISCARDED,
+                                 count,
+                                 type);
+        sw_logger()->put(SW_LOG_WARNING, sw_error, len);
     }
-    co->yield();
 }
 
-void *Channel::pop(double timeout) {
-    Coroutine *current_co = Coroutine::get_current_safe();
-    if (closed && is_empty()) {
-        return nullptr;
+void ChannelBase::yield(Opcode type) {
+    Coroutine *co = Coroutine::get_current_safe();
+    Coroutine::CancelFunc cancel_fn = [this, type](Coroutine *co) {
+        if (type == CONSUMER) {
+            consumer_remove(co);
+        } else {
+            producer_remove(co);
+        }
+        co->resume();
+        return true;
+    };
+    if (type == PRODUCER) {
+        producer_queue.push_back(co);
+        swoole_trace_log(SW_TRACE_CHANNEL, "producer cid=%ld", co->get_cid());
+    } else {
+        consumer_queue.push_back(co);
+        swoole_trace_log(SW_TRACE_CHANNEL, "consumer cid=%ld", co->get_cid());
     }
-    if (is_empty() || !consumer_queue.empty()) {
-        TimeoutMessage msg;
-        msg.error = false;
-        msg.timer = nullptr;
+    try {
+        co->yield(&cancel_fn);
+    } catch (...) {
+        // A failed suspension must not leave a waiter pointing into the unwound stack.
+        if (type == CONSUMER) {
+            consumer_remove(co);
+        } else {
+            producer_remove(co);
+        }
+        throw;
+    }
+}
+
+bool ChannelBase::wait_pop(bool empty, double timeout) {
+    Coroutine *current_co = Coroutine::get_current_safe();
+    if (sw_unlikely(closed && empty)) {
+        error_ = ERROR_CLOSED;
+        return false;
+    }
+    if (empty || !consumer_queue.empty()) {
+        TimeoutMessage msg(this, CONSUMER, current_co);
         if (timeout > 0) {
-            long msec = (long) (timeout * 1000);
-            msg.chan = this;
-            msg.type = CONSUMER;
-            msg.co = current_co;
-            msg.timer = swoole_timer_add(msec, false, timer_callback, &msg);
+            msg.timer = swoole_timer_add(timeout, false, timer_callback, &msg);
         }
 
         yield(CONSUMER);
 
-        if (msg.timer) {
-            swoole_timer_del(msg.timer);
-        }
-        if (msg.error || (closed && is_empty())) {
-            return nullptr;
-        }
-    }
-    /**
-     * pop data
-     */
-    void *data = data_queue.front();
-    data_queue.pop();
-    /**
-     * notify producer
-     */
-    if (!producer_queue.empty()) {
-        Coroutine *co = pop_coroutine(PRODUCER);
-        co->resume();
-    }
-    return data;
-}
-
-bool Channel::push(void *data, double timeout) {
-    Coroutine *current_co = Coroutine::get_current_safe();
-    if (closed) {
-        return false;
-    }
-    if (is_full() || !producer_queue.empty()) {
-        TimeoutMessage msg;
-        msg.error = false;
-        msg.timer = nullptr;
-        if (timeout > 0) {
-            long msec = (long) (timeout * 1000);
-            msg.chan = this;
-            msg.type = PRODUCER;
-            msg.co = current_co;
-            msg.timer = swoole_timer_add(msec, false, timer_callback, &msg);
-        }
-
-        yield(PRODUCER);
-
-        if (msg.timer) {
-            swoole_timer_del(msg.timer);
-        }
-        if (msg.error || closed) {
+        if (sw_unlikely(current_co->is_canceled())) {
+            error_ = ERROR_CANCELED;
             return false;
         }
-    }
-    /**
-     * push data
-     */
-    data_queue.push(data);
-    swTraceLog(SW_TRACE_CHANNEL, "push data to channel, count=%ld", length());
-    /**
-     * notify consumer
-     */
-    if (!consumer_queue.empty()) {
-        Coroutine *co = pop_coroutine(CONSUMER);
-        co->resume();
+        if (sw_unlikely(msg.error)) {
+            error_ = ERROR_TIMEOUT;
+            return false;
+        }
     }
     return true;
 }
 
-bool Channel::close() {
-    if (closed) {
+bool ChannelBase::wait_push(bool full, double timeout) {
+    Coroutine *current_co = Coroutine::get_current_safe();
+    if (sw_unlikely(closed)) {
+        error_ = ERROR_CLOSED;
         return false;
     }
-    swTraceLog(SW_TRACE_CHANNEL, "channel closed");
+    if (full || !producer_queue.empty()) {
+        TimeoutMessage msg(this, PRODUCER, current_co);
+        if (timeout > 0) {
+            msg.timer = swoole_timer_add(timeout, false, timer_callback, &msg);
+        }
+
+        yield(PRODUCER);
+
+        if (sw_unlikely(current_co->is_canceled())) {
+            error_ = ERROR_CANCELED;
+            return false;
+        }
+        if (sw_unlikely(msg.error)) {
+            error_ = ERROR_TIMEOUT;
+            return false;
+        }
+        if (sw_unlikely(closed)) {
+            error_ = ERROR_CLOSED;
+            return false;
+        }
+    }
+    return true;
+}
+
+void ChannelBase::notify_consumer() {
+    if (!consumer_queue.empty()) {
+        Coroutine *co = pop_coroutine(CONSUMER);
+        co->resume();
+    }
+}
+
+void ChannelBase::notify_producer() {
+    if (!producer_queue.empty()) {
+        Coroutine *co = pop_coroutine(PRODUCER);
+        co->resume();
+    }
+}
+
+bool ChannelBase::close() {
+    if (sw_unlikely(closed)) {
+        return false;
+    }
+    swoole_trace_log(SW_TRACE_CHANNEL, "channel closed");
     closed = true;
     while (!producer_queue.empty()) {
         Coroutine *co = pop_coroutine(PRODUCER);

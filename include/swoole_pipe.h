@@ -10,14 +10,13 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_socket.h"
 
 enum swPipe_close_which {
@@ -35,60 +34,60 @@ class SocketPair {
     double timeout;
 
     /**
-     * master : socks[1]
-     * worker : socks[0]
+     * master : socks[1], for write operation
+     * worker : socks[0], for read operation
      */
-    int socks[2];
+    swSocketFd socks[2]{};
 
     network::Socket *master_socket = nullptr;
     network::Socket *worker_socket = nullptr;
 
-    bool init_socket(int master_fd, int worker_fd);
+    void init_socket(swSocketFd master_fd, swSocketFd worker_fd);
 
   public:
-    SocketPair(bool _blocking) {
+    explicit SocketPair(bool _blocking) {
         blocking = _blocking;
         timeout = network::Socket::default_read_timeout;
     }
-    ~SocketPair();
+    virtual ~SocketPair();
 
-    ssize_t read(void *_buf, size_t length);
-    ssize_t write(const void *_buf, size_t length);
+    ssize_t read(void *_buf, size_t length) const;
+    ssize_t write(const void *_buf, size_t length) const;
+    void clean() const;
     bool close(int which = 0);
 
-    network::Socket *get_socket(bool _master) {
+    network::Socket *get_socket(bool _master) const {
         return _master ? master_socket : worker_socket;
     }
 
-    bool ready() {
+    bool ready() const {
         return master_socket != nullptr && worker_socket != nullptr;
     }
 
+    // Contract: only call after ready() is true; constructors leave sockets null when OS setup fails.
     void set_timeout(double _timeout) {
         timeout = _timeout;
+        master_socket->set_timeout(timeout);
+        worker_socket->set_timeout(timeout);
     }
 
-    void set_blocking(bool blocking) {
-        if (blocking) {
-            worker_socket->set_block();
-            master_socket->set_block();
-        } else {
-            worker_socket->set_nonblock();
-            master_socket->set_nonblock();
-        }
-    }
+    // Contract: only call after ready() is true; constructors leave sockets null when OS setup fails.
+    void set_blocking(bool _blocking);
 };
 
 class Pipe : public SocketPair {
- public:
-    Pipe(bool blocking);
+  public:
+    explicit Pipe(bool blocking);
 };
 
+#ifndef _WIN32
 class UnixSocket : public SocketPair {
     int protocol_;
+
   public:
     UnixSocket(bool blocking, int _protocol);
-    bool set_buffer_size(size_t _size);
+    bool set_buffer_size(size_t _size) const;
 };
+#endif
 
 }  // namespace swoole

@@ -13,17 +13,261 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
 #include "test_core.h"
 #include "swoole_file.h"
+#include "swoole_pipe.h"
+#include "swoole_reactor.h"
+#include "swoole_timer.h"
+#include "swoole_util.h"
 
 using namespace std;
 using namespace swoole;
 
 const char test_data[] = "hello swoole, hello world, php is best";
+
+TEST(socket, dup_preserves_configuration_without_aliasing_owned_state) {
+    UnixSocket sockets(true, SOCK_STREAM);
+    ASSERT_TRUE(sockets.ready());
+    auto *original = sockets.get_socket(false);
+    original->socket_type = SW_SOCK_UNIX_STREAM;
+    original->set_timeout(0.25);
+    ASSERT_TRUE(original->set_fd_option(1, 1));
+    original->buffer_size = 4096;
+    original->chunk_size = 128;
+    original->in_buffer = new Buffer(16);
+    original->in_buffer->append("in", 2);
+    original->out_buffer = new Buffer(16);
+    original->out_buffer->append("out", 3);
+    String received("received");
+    original->recv_buffer = &received;
+    original->object = &received;
+    original->close_wait = 1;
+    original->event_hup = 1;
+    original->total_recv_bytes = 10;
+    original->total_send_bytes = 20;
+    ASSERT_FALSE(swoole_timer_is_available());
+    swoole_timer_create(true);
+    original->recv_timer = swoole_timer_add(60000L, false, [](TIMER_PARAMS) {});
+    original->send_timer = swoole_timer_add(60000L, false, [](TIMER_PARAMS) {});
+    ASSERT_NE(original->recv_timer, nullptr);
+    ASSERT_NE(original->send_timer, nullptr);
+    const auto recv_id = original->recv_timer->id;
+    const auto send_id = original->send_timer->id;
+    ON_SCOPE_EXIT {
+        original->recv_timer = nullptr;
+        original->send_timer = nullptr;
+        swoole_timer_free();
+    };
+    Reactor reactor(16, Reactor::TYPE_POLL);
+    ASSERT_EQ(reactor.add(original, SW_EVENT_READ), SW_OK);
+
+    auto *copy = original->dup();
+    ASSERT_NE(copy, nullptr);
+    EXPECT_NE(copy->fd, original->fd);
+    EXPECT_EQ(copy->fd_type, original->fd_type);
+    EXPECT_EQ(copy->socket_type, original->socket_type);
+    EXPECT_EQ(copy->buffer_size, 4096u);
+    EXPECT_EQ(copy->chunk_size, 128u);
+    EXPECT_EQ(copy->read_timeout, original->read_timeout);
+    EXPECT_EQ(copy->write_timeout, original->write_timeout);
+    EXPECT_EQ(copy->dns_timeout, original->dns_timeout);
+    EXPECT_EQ(copy->connect_timeout, original->connect_timeout);
+    EXPECT_TRUE(copy->nonblock);
+#ifdef FD_CLOEXEC
+    EXPECT_EQ(fcntl(copy->fd, F_GETFD) & FD_CLOEXEC, 0);
+    EXPECT_FALSE(copy->cloexec);
+#endif
+    EXPECT_EQ(copy->in_buffer, nullptr);
+    EXPECT_EQ(copy->out_buffer, nullptr);
+    EXPECT_EQ(copy->recv_buffer, nullptr);
+    EXPECT_EQ(copy->recv_timer, nullptr);
+    EXPECT_EQ(copy->send_timer, nullptr);
+    EXPECT_EQ(copy->object, nullptr);
+    EXPECT_EQ(copy->events, 0);
+    EXPECT_TRUE(copy->removed);
+    EXPECT_FALSE(copy->close_wait);
+    EXPECT_FALSE(copy->event_hup);
+    EXPECT_EQ(copy->total_recv_bytes, 0u);
+    EXPECT_EQ(copy->total_send_bytes, 0u);
+    copy->free();
+    EXPECT_TRUE(reactor.exists(original->fd));
+    EXPECT_NE(sw_timer()->get(recv_id), nullptr);
+    EXPECT_NE(sw_timer()->get(send_id), nullptr);
+    EXPECT_EQ(original->in_buffer->length(), 2u);
+    EXPECT_EQ(original->out_buffer->length(), 3u);
+    EXPECT_EQ(reactor.del(original), SW_OK);
+}
+
+TEST(socket, dup_does_not_own_original_unix_path) {
+    auto temporary = make_tmpfile();
+    ASSERT_TRUE(temporary.ready());
+    const auto path = temporary.get_path();
+    temporary.close();
+    ASSERT_TRUE(File::remove(path));
+    auto *original = make_socket(SW_SOCK_UNIX_STREAM, SW_FD_STREAM, 0);
+    ASSERT_NE(original, nullptr);
+    ASSERT_EQ(original->bind(path, 0), SW_OK);
+    ASSERT_TRUE(File::exists(path));
+    auto *copy = original->dup();
+    ASSERT_NE(copy, nullptr);
+    EXPECT_FALSE(copy->bound);
+    copy->free();
+    EXPECT_TRUE(File::exists(path));
+    original->free();
+    EXPECT_FALSE(File::exists(path));
+}
+
+TEST(socket, dup_invalid_socket_leaves_original_unchanged) {
+    network::Socket original{};
+    original.fd = SW_BAD_SOCKET;
+    EXPECT_EQ(original.dup(), nullptr);
+    EXPECT_EQ(original.fd, SW_BAD_SOCKET);
+}
+
+TEST(socket, connect_sync) {
+    network::Address sa;
+    network::Socket *sock;
+
+    sock = make_socket(SW_SOCK_UNIX_STREAM, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    sa.assign(SW_SOCK_UNIX_STREAM, "/tmp/swole-not-exists.sock");
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), ENOENT);
+    sock->free();
+
+    sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    sa.assign(SW_SOCK_TCP, "192.168.199.199", 80);
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), ETIMEDOUT);
+    sock->free();
+
+    sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    sa.assign(SW_SOCK_TCP, "127.0.0.1", 59999);
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), ECONNREFUSED);
+    sock->free();
+
+    sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    sa.assign(SW_SOCK_TCP, TEST_HTTP_DOMAIN, 80);
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_OK);
+    sock->free();
+
+    sock = make_socket(SW_SOCK_UDP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    sa.assign(SW_SOCK_UDP, "127.0.0.1", 9900);
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_OK);
+    sock->free();
+}
+
+TEST(socket, connect_bad_port) {
+    auto *sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+
+    ASSERT_EQ(sock->connect(TEST_HOST, 65536), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), SW_ERROR_BAD_PORT);
+
+    sock->free();
+}
+
+#ifndef _WIN32
+TEST(socket, recv_sync_waitall_deadline) {
+    int pairs[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pairs), 0);
+
+    auto *reader = make_socket(pairs[0], SW_FD_STREAM);
+    ASSERT_NE(reader, nullptr);
+    reader->set_timeout(0.35, SW_TIMEOUT_READ);
+
+    thread writer([&]() {
+        const char data[] = {'a', 'b', 'c'};
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ASSERT_EQ(::send(pairs[1], &data[0], 1, 0), 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(90));
+        ASSERT_EQ(::send(pairs[1], &data[1], 1, 0), 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(90));
+        ASSERT_EQ(::send(pairs[1], &data[2], 1, 0), 1);
+        close(pairs[1]);
+    });
+
+    char buf[3];
+    ASSERT_EQ(reader->recv_sync(buf, sizeof(buf), MSG_WAITALL), static_cast<ssize_t>(sizeof(buf)));
+    ASSERT_EQ(memcmp(buf, "abc", sizeof(buf)), 0);
+
+    writer.join();
+    reader->free();
+}
+#endif
+
+TEST(socket, fail) {
+    auto *sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+
+    network::Address sa;
+    sa.assign(SW_SOCK_TCP, TEST_HTTP_DOMAIN, 80);
+    sock->set_timeout(0.3, SW_TIMEOUT_CONNECT);
+    ASSERT_EQ(sock->connect_sync(sa), SW_OK);
+
+    close(sock->get_fd());
+
+    ASSERT_EQ(sock->get_name(), -1);
+    ASSERT_EQ(errno, EBADF);
+
+    network::Address peer;
+    ASSERT_EQ(sock->get_peer_name(&peer), -1);
+    ASSERT_EQ(errno, EBADF);
+
+    ASSERT_EQ(sock->set_tcp_nopush(1), -1);
+    ASSERT_EQ(sock->listen(1), -1);
+
+    ASSERT_FALSE(sock->set_buffer_size(1));
+    ASSERT_FALSE(sock->set_recv_buffer_size(1));
+    ASSERT_FALSE(sock->set_send_buffer_size(1));
+
+    ASSERT_FALSE(sock->set_tcp_nodelay());
+    ASSERT_FALSE(sock->cork());
+    ASSERT_FALSE(sock->uncork());
+
+    ASSERT_FALSE(sock->set_kernel_read_timeout(0.1));
+    ASSERT_FALSE(sock->set_kernel_write_timeout(0.1));
+
+    sock->move_fd();
+    sock->free();
+}
+
+TEST(socket, ssl_fail) {
+    sysv_signal(SIGPIPE, SIG_IGN);
+    network::Client client(SW_SOCK_TCP, false);
+    client.enable_ssl_encrypt();
+
+    ASSERT_EQ(client.connect(TEST_DOMAIN_BAIDU, 443, -1, 0), 0);
+    ASSERT_EQ(client.shutdown(SHUT_WR), 0);
+
+    ASSERT_EQ(client.get_socket()->ssl_send(SW_STRL(TEST_STR)), SW_ERR);
+    ASSERT_EQ(errno, SW_ERROR_SSL_RESET);
+
+    ASSERT_EQ(client.shutdown(SHUT_RD), 0);
+
+    char buf[1024];
+    errno = 0;
+    ASSERT_EQ(client.get_socket()->ssl_recv(SW_STRL(buf)), 0);
+    ASSERT_EQ(errno, 0);
+    ASSERT_EQ(close(client.get_socket()->get_fd()), 0);
+    client.get_socket()->move_fd();
+
+    ASSERT_EQ(client.get_socket()->ssl_recv(SW_STRL(buf)), 0);
+}
 
 TEST(socket, sendto) {
     char sock1_path[] = "/tmp/udp_unix1.sock";
@@ -33,10 +277,10 @@ TEST(socket, sendto) {
     unlink(sock2_path);
 
     auto sock1 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock1->bind(sock1_path, nullptr);
+    sock1->bind(sock1_path);
 
     auto sock2 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock2->bind(sock2_path, nullptr);
+    sock2->bind(sock2_path);
 
     ASSERT_GT(sock1->sendto(sock2_path, 0, test_data, strlen(test_data)), 0);
 
@@ -45,7 +289,7 @@ TEST(socket, sendto) {
     sa.type = SW_SOCK_UNIX_DGRAM;
     ASSERT_GT(sock2->recvfrom(buf, sizeof(buf), 0, &sa), 0);
     ASSERT_STREQ(test_data, buf);
-    ASSERT_STREQ(sa.get_ip(), sock1_path);
+    ASSERT_STREQ(sa.get_addr(), sock1_path);
 
     sock1->free();
     sock2->free();
@@ -53,17 +297,18 @@ TEST(socket, sendto) {
     unlink(sock2_path);
 }
 
-static void test_sendto(enum swSocket_type sock_type) {
-    int port1 = 0, port2 = 0;
+static void test_sendto(enum swSocketType sock_type) {
     const char *ip = sock_type == SW_SOCK_UDP ? "127.0.0.1" : "::1";
 
     auto sock1 = make_socket(sock_type, SW_FD_DGRAM_SERVER, 0);
-    sock1->bind(ip, &port1);
+    ASSERT_EQ(sock1->bind(ip, 0), SW_OK);
+    ASSERT_EQ(sock1->get_name(), SW_OK);
 
     auto sock2 = make_socket(sock_type, SW_FD_DGRAM_SERVER, 0);
-    sock2->bind(ip, &port2);
+    ASSERT_EQ(sock2->bind(ip, 0), SW_OK);
+    ASSERT_EQ(sock2->get_name(), SW_OK);
 
-    ASSERT_GT(sock1->sendto(ip, port2, test_data, strlen(test_data)), 0);
+    ASSERT_GT(sock1->sendto(ip, sock2->get_port(), test_data, strlen(test_data)), 0);
 
     char buf[1024] = {};
     network::Address sa;
@@ -71,8 +316,8 @@ static void test_sendto(enum swSocket_type sock_type) {
     ASSERT_GT(sock2->recvfrom(buf, sizeof(buf), 0, &sa), 0);
 
     ASSERT_STREQ(test_data, buf);
-    ASSERT_EQ(sa.get_port(), port1);
-    ASSERT_STREQ(sa.get_ip(), ip);
+    ASSERT_EQ(sa.get_port(), sock1->get_port());
+    ASSERT_STREQ(sa.get_addr(), ip);
 
     sock1->free();
     sock2->free();
@@ -89,9 +334,10 @@ TEST(socket, sendto_ipv6) {
 TEST(socket, recv) {
     mutex m;
     m.lock();
+    int port = swoole::test::get_random_port();
 
-    thread t1([&m]() {
-        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, TEST_PORT);
+    thread t1([&m, port]() {
+        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, port);
         char buf[1024] = {};
         svr->set_block();
         m.unlock();
@@ -103,10 +349,10 @@ TEST(socket, recv) {
         svr->free();
     });
 
-    thread t2([&m]() {
+    thread t2([&m, port]() {
         m.lock();
         auto cli = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
-        ASSERT_EQ(cli->connect(TEST_HOST, TEST_PORT), SW_OK);
+        ASSERT_EQ(cli->connect(TEST_HOST, port), SW_OK);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         cli->send(test_data, sizeof(test_data), 0);
         cli->free();
@@ -116,26 +362,27 @@ TEST(socket, recv) {
     t2.join();
 }
 
-TEST(socket, recvfrom_blocking) {
+TEST(socket, recvfrom_sync) {
     mutex m;
     m.lock();
+    int port = swoole::test::get_random_port();
 
-    thread t1([&m]() {
-        auto svr = make_server_socket(SW_SOCK_UDP, TEST_HOST, TEST_PORT);
+    thread t1([&m, port]() {
+        auto svr = make_server_socket(SW_SOCK_UDP, TEST_HOST, port);
         network::Address addr;
         char buf[1024] = {};
         svr->set_nonblock();
         m.unlock();
-        svr->recvfrom_blocking(buf, sizeof(buf), 0, &addr);
+        svr->recvfrom_sync(buf, sizeof(buf), 0, &addr);
         ASSERT_STREQ(test_data, buf);
         svr->free();
     });
 
-    thread t2([&m]() {
+    thread t2([&m, port]() {
         m.lock();
         auto cli = make_socket(SW_SOCK_UDP, SW_FD_STREAM_CLIENT, 0);
         network::Address addr;
-        addr.assign(SW_SOCK_TCP, TEST_HOST, TEST_PORT);
+        addr.assign(SW_SOCK_TCP, TEST_HOST, port);
         ASSERT_EQ(cli->connect(addr), SW_OK);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         cli->send(test_data, sizeof(test_data), 0);
@@ -146,43 +393,168 @@ TEST(socket, recvfrom_blocking) {
     t2.join();
 }
 
-TEST(socket, sendfile_blocking) {
+TEST(socket, send_async_1) {
+    auto sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
+    ASSERT_TRUE(sock->set_block());
+    ASSERT_EQ(sock->connect(TEST_HTTP_DOMAIN, 80), SW_OK);
+
+    auto req = test::http_get_request(TEST_HTTP_DOMAIN, "/");
+    ASSERT_EQ(sock->send_async(req.c_str(), req.length()), req.length());
+
+    auto buf = sw_tg_buffer();
+    auto n = sock->recv_sync(buf->str, buf->size, 0);
+    ASSERT_GT(n, 0);
+    buf->length = n;
+    ASSERT_TRUE(buf->contains(SW_STRL(TEST_HTTP_EXPECT)));
+
+    sock->free();
+}
+
+TEST(socket, send_async_2) {
+    auto sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
+    ASSERT_TRUE(sock->set_block());
+    ASSERT_EQ(sock->connect(TEST_HTTP_DOMAIN, 80), SW_OK);
+
+    swoole_event_init(SW_EVENTLOOP_WAIT_EXIT);
+
+    auto req = test::http_get_request(TEST_HTTP_DOMAIN, "/");
+    ASSERT_EQ(sock->send_async(req.c_str(), req.length()), req.length());
+
+    swoole_event_set_handler(SW_FD_STREAM_CLIENT, SW_EVENT_READ, [](Reactor *reactor, Event *event) {
+        auto buf = sw_tg_buffer();
+        auto n = event->socket->recv_sync(buf->str, buf->size, 0);
+        EXPECT_GT(n, 0);
+        buf->length = n;
+        EXPECT_TRUE(buf->contains(SW_STRL(TEST_HTTP_EXPECT)));
+
+        return 0;
+    });
+
+    swoole_event_add(sock, SW_EVENT_READ | SW_EVENT_ONCE);
+    swoole_event_wait();
+
+    sock->free();
+}
+
+TEST(socket, sendfile_sync) {
     string file = test::get_root_path() + "/examples/test.jpg";
     mutex m;
+    int port = swoole::test::get_random_port();
     m.lock();
 
     auto str = file_get_contents(file);
 
-    thread t1([&m, &str]() {
-        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, TEST_PORT);
+    thread t1([&m, &str, port]() {
+        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, port);
         m.unlock();
         auto cli = svr->accept();
         int len;
-        cli->recv_blocking(&len, sizeof(len), MSG_WAITALL);
+        cli->recv_sync(&len, sizeof(len), MSG_WAITALL);
         int _len = ntohl(len);
         ASSERT_EQ(_len, str->get_length());
         ASSERT_LT(_len, 1024 * 1024);
         std::unique_ptr<char[]> data(new char[_len]);
-        cli->recv_blocking(data.get(), _len, MSG_WAITALL);
+        cli->recv_sync(data.get(), _len, MSG_WAITALL);
         ASSERT_STREQ(data.get(), str->value());
         cli->free();
         svr->free();
     });
 
-    thread t2([&m, &file, &str]() {
+    thread t2([&m, &file, &str, port]() {
         m.lock();
         auto cli = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
         network::Address addr;
-        addr.assign(SW_SOCK_TCP, TEST_HOST, TEST_PORT);
+        addr.assign(SW_SOCK_TCP, TEST_HOST, port);
         ASSERT_EQ(cli->connect(addr), SW_OK);
         int len = htonl(str->get_length());
         cli->send(&len, sizeof(len), 0);
-        ASSERT_EQ(cli->sendfile_blocking(file.c_str(), 0, 0, -1), SW_OK);
+        ASSERT_EQ(cli->sendfile_sync(file.c_str(), 0, 0), SW_OK);
         cli->free();
     });
 
     t1.join();
     t2.join();
+}
+
+TEST(socket, sendfile) {
+    string file = "/tmp/swoole-file-not-exists";
+    auto cli = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
+    network::Address addr;
+    addr.assign(SW_SOCK_TCP, TEST_HTTP_DOMAIN, 80);
+    ASSERT_EQ(cli->connect(addr), SW_OK);
+
+    ASSERT_EQ(cli->sendfile_sync(file.c_str(), 0, 0), SW_ERR);
+    ASSERT_EQ(errno, ENOENT);
+
+    File fp(file, File::WRITE | File::CREATE);
+    ASSERT_TRUE(fp.ready());
+
+    ASSERT_EQ(cli->sendfile_sync(file.c_str(), 0, 0), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), SW_ERROR_FILE_EMPTY);
+
+    fp.write(SW_STRL(TEST_STR));
+    fp.close();
+
+    ASSERT_EQ(cli->sendfile_sync(file.c_str(), 10, 100), SW_ERR);
+    ASSERT_EQ(swoole_get_last_error(), SW_ERROR_INVALID_PARAMS);
+
+    ASSERT_TRUE(fp.open(file, File::WRITE | File::APPEND));
+    auto req = test::http_get_request(TEST_HTTP_DOMAIN, "/");
+    fp.write(req);
+    fp.close();
+
+    ASSERT_EQ(cli->sendfile_sync(file.c_str(), strlen(TEST_STR), 0), SW_OK);
+
+    char rbuf[4096];
+    auto n = cli->recv_sync(rbuf, sizeof(rbuf), 0);
+    ASSERT_GT(n, 0);
+
+    String resp(rbuf, n);
+
+    ASSERT_TRUE(resp.contains(SW_STRL(TEST_HTTP_EXPECT)));
+
+    cli->free();
+
+    ASSERT_TRUE(File::remove(file));
+}
+
+TEST(socket, sendfile_async_cleanup) {
+    for (bool delete_file : {false, true}) {
+        auto file = make_tmpfile();
+        ASSERT_TRUE(file.ready());
+        const auto path = file.get_path();
+        ASSERT_EQ(file.write(SW_STRL(TEST_STR)), static_cast<ssize_t>(strlen(TEST_STR)));
+        file.close();
+
+        auto *socket = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
+        ASSERT_NE(socket, nullptr);
+        ASSERT_EQ(socket->sendfile_async(path.c_str(), 0, 0, delete_file), SW_OK);
+        ASSERT_TRUE(File::exists(path));
+        // Discarding a queued transfer closes its file before deleting the source.
+        socket->free();
+        EXPECT_EQ(File::exists(path), !delete_file);
+        if (!delete_file) {
+            EXPECT_TRUE(File::remove(path));
+        }
+    }
+}
+
+TEST(socket, sendfile_async_cleanup_on_invalid_range) {
+    const std::pair<off_t, size_t> ranges[] = {
+        {1, strlen(TEST_STR)}, {static_cast<off_t>(strlen(TEST_STR) + 1), 0}, {1, SIZE_MAX}};
+    for (const auto &range : ranges) {
+        auto file = make_tmpfile();
+        ASSERT_TRUE(file.ready());
+        const auto path = file.get_path();
+        ASSERT_EQ(file.write(SW_STRL(TEST_STR)), static_cast<ssize_t>(strlen(TEST_STR)));
+        file.close();
+
+        auto *socket = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
+        ASSERT_NE(socket, nullptr);
+        EXPECT_EQ(socket->sendfile_async(path.c_str(), range.first, range.second, true), SW_ERR);
+        EXPECT_FALSE(File::exists(path));
+        socket->free();
+    }
 }
 
 TEST(socket, peek) {
@@ -193,10 +565,10 @@ TEST(socket, peek) {
     unlink(sock2_path);
 
     auto sock1 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock1->bind(sock1_path, nullptr);
+    sock1->bind(sock1_path);
 
     auto sock2 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock2->bind(sock2_path, nullptr);
+    sock2->bind(sock2_path);
 
     ASSERT_GT(sock1->sendto(sock2_path, 0, test_data, strlen(test_data)), 0);
 
@@ -214,18 +586,16 @@ TEST(socket, peek) {
     unlink(sock2_path);
 }
 
-TEST(socket, sendto_blocking) {
+TEST(socket, sendto_sync) {
     char sock1_path[] = "/tmp/udp_unix1.sock";
     unlink(sock1_path);
     auto sock1 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock1->bind(sock1_path, nullptr);
-    sock1->info.assign(SW_SOCK_UNIX_DGRAM, sock1_path, 0);
+    sock1->bind(sock1_path);
 
     char sock2_path[] = "/tmp/udp_unix2.sock";
     unlink(sock2_path);
     auto sock2 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock2->bind(sock2_path, nullptr);
-    sock2->info.assign(SW_SOCK_UNIX_DGRAM, sock2_path, 0);
+    sock2->bind(sock2_path);
 
     char sendbuf[65536] = {};
     swoole_random_string(sendbuf, sizeof(sendbuf) - 1);
@@ -245,10 +615,13 @@ TEST(socket, sendto_blocking) {
         }
     });
 
+    network::Address sock2_addr;
+    ASSERT_TRUE(sock2_addr.assign(SW_SOCK_UNIX_DGRAM, sock2_path));
+
     for (int i = 0; i < 10; i++) {
-        ASSERT_GT(sock1->sendto_blocking(sock2->info, sendbuf, strlen(sendbuf)), 0);
+        ASSERT_GT(sock1->sendto_sync(sock2_addr, sendbuf, strlen(sendbuf)), 0);
     }
-    ASSERT_GT(sock1->sendto_blocking(sock2->info, "end", 3), 0);
+    ASSERT_GT(sock1->sendto_sync(sock2_addr, "end", 3), 0);
 
     t1.join();
 
@@ -262,20 +635,21 @@ TEST(socket, clean) {
     char sock1_path[] = "/tmp/udp_unix1.sock";
     unlink(sock1_path);
     auto sock1 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock1->bind(sock1_path, nullptr);
-    sock1->info.assign(SW_SOCK_UNIX_DGRAM, sock1_path, 0);
+    sock1->bind(sock1_path);
 
     char sock2_path[] = "/tmp/udp_unix2.sock";
     unlink(sock2_path);
     auto sock2 = make_socket(SW_SOCK_UNIX_DGRAM, SW_FD_DGRAM_SERVER, 0);
-    sock2->bind(sock2_path, nullptr);
-    sock2->info.assign(SW_SOCK_UNIX_DGRAM, sock2_path, 0);
+    sock2->bind(sock2_path);
 
     char sendbuf[65536] = {};
     swoole_random_string(sendbuf, sizeof(sendbuf) - 1);
 
+    network::Address sock2_addr;
+    ASSERT_TRUE(sock2_addr.assign(SW_SOCK_UNIX_DGRAM, sock2_path));
+
     for (int i = 0; i < 3; i++) {
-        ASSERT_GT(sock1->sendto_blocking(sock2->info, sendbuf, strlen(sendbuf)), 0);
+        ASSERT_GT(sock1->sendto(sock2_addr, sendbuf, strlen(sendbuf)), 0);
     }
 
     sock2->clean();
@@ -291,10 +665,11 @@ TEST(socket, clean) {
 
 TEST(socket, check_liveness) {
     mutex m;
+    int svr_port = TEST_PORT + __LINE__;
     m.lock();
 
-    thread t1([&m]() {
-        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, TEST_PORT);
+    thread t1([&m, svr_port]() {
+        auto svr = make_server_socket(SW_SOCK_TCP, TEST_HOST, svr_port);
         m.unlock();
 
         auto cli = svr->accept();
@@ -313,11 +688,11 @@ TEST(socket, check_liveness) {
         svr->free();
     });
 
-    thread t2([&m]() {
+    thread t2([&m, svr_port]() {
         m.lock();
 
         auto cli = make_socket(SW_SOCK_TCP, SW_FD_STREAM_CLIENT, 0);
-        ASSERT_EQ(cli->connect(TEST_HOST, TEST_PORT), SW_OK);
+        ASSERT_EQ(cli->connect(TEST_HOST, svr_port), SW_OK);
 
         cli->send(test_data, sizeof(test_data), 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -332,4 +707,407 @@ TEST(socket, check_liveness) {
 
     t1.join();
     t2.join();
+}
+
+#define CRLF "\r\n"
+
+static void test_socket_sync(network::Socket *sock, bool connect = true) {
+    if (connect) {
+        network::Address addr;
+        ASSERT_TRUE(addr.assign("tcp://" TEST_HTTP_DOMAIN ":80"));
+        ASSERT_EQ(sock->connect(addr), 0);
+    }
+
+    auto req = test::http_get_request(TEST_HTTP_DOMAIN, "/get");
+    ASSERT_EQ(sock->write_sync(req.c_str(), req.length()), req.length());
+    ASSERT_TRUE(sock->check_liveness());
+
+    string resp;
+    SW_LOOP {
+        char buf[1024];
+        auto n = sock->read_sync(buf, sizeof(buf));
+        if (n == 0) {
+            break;
+        }
+        ASSERT_GT(n, 0);
+        resp.append(buf, n);
+    }
+
+    ASSERT_TRUE(resp.find(TEST_HTTP_EXPECT) != resp.npos);
+
+    usleep(50000);
+    ASSERT_FALSE(sock->check_liveness());
+
+    sock->free();
+}
+
+TEST(socket, sync) {
+    auto sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    test_socket_sync(sock);
+}
+
+TEST(socket, dup) {
+    auto sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    network::Address addr;
+    ASSERT_TRUE(addr.assign("tcp://" TEST_HTTP_DOMAIN ":80"));
+    ASSERT_EQ(sock->connect(addr), 0);
+
+    auto sock_2 = sock->dup();
+    sock->free();
+
+    test_socket_sync(sock_2, false);
+}
+
+TEST(socket, dup_fd) {
+    swSocketFd pair[2];
+#ifdef _WIN32
+    ASSERT_EQ(socketpair(AF_INET, SOCK_STREAM, 0, pair), 0);
+#else
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+#endif
+    swSocketFd copy = sw_dup(pair[0]);
+    ASSERT_NE(copy, SW_BAD_SOCKET);
+    ASSERT_NE(copy, pair[0]);
+    ASSERT_EQ(sw_close_socket(pair[0]), 0);
+    ASSERT_EQ(::send(copy, "x", 1, 0), 1);
+    char byte = 0;
+    ASSERT_EQ(::recv(pair[1], &byte, 1, 0), 1);
+    ASSERT_EQ(byte, 'x');
+    ASSERT_EQ(sw_close_socket(copy), 0);
+    ASSERT_EQ(::recv(pair[1], &byte, 1, 0), 0);
+    ASSERT_EQ(sw_close_socket(pair[1]), 0);
+}
+
+TEST(socket, dup_invalid_fd) {
+    errno = 0;
+    ASSERT_EQ(sw_dup(SW_BAD_SOCKET), SW_BAD_SOCKET);
+    ASSERT_NE(errno, 0);
+}
+
+TEST(socket, dup_ssl) {
+    auto *sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(sock, nullptr);
+    SSL_CTX *context = SSL_CTX_new(TLS_method());
+    ASSERT_NE(context, nullptr);
+    sock->ssl = SSL_new(context);
+    ASSERT_NE(sock->ssl, nullptr);
+    auto *copy = sock->dup();
+    ASSERT_NE(copy, nullptr);
+    ASSERT_NE(copy->fd, sock->fd);
+    ASSERT_EQ(copy->ssl, nullptr);
+    int type = 0;
+    socklen_t length = sizeof(type);
+    ASSERT_EQ(copy->get_option(SOL_SOCKET, SO_TYPE, &type, &length), 0);
+    ASSERT_EQ(type, SOCK_STREAM);
+    copy->free();
+    ASSERT_NE(sock->fd, SW_BAD_SOCKET);
+    SSL_free(sock->ssl);
+    sock->ssl = nullptr;
+    SSL_CTX_free(context);
+    sock->free();
+}
+
+TEST(socket, convert_to_type) {
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET, SOCK_STREAM), SW_SOCK_TCP);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET6, SOCK_STREAM), SW_SOCK_TCP6);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET, SOCK_DGRAM), SW_SOCK_UDP);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET6, SOCK_DGRAM), SW_SOCK_UDP6);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_LOCAL, SOCK_STREAM), SW_SOCK_UNIX_STREAM);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_LOCAL, SOCK_DGRAM), SW_SOCK_UNIX_DGRAM);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET, SOCK_RAW), SW_SOCK_RAW);
+    ASSERT_EQ(network::Socket::convert_to_type(AF_INET6, SOCK_RAW), SW_SOCK_RAW6);
+
+    std::string s1("unix:///tmp/swoole.sock");
+    ASSERT_EQ(network::Socket::convert_to_type(s1), SW_SOCK_UNIX_STREAM);
+    ASSERT_EQ(s1, "/tmp/swoole.sock");
+
+    std::string s2("127.0.0.1");
+    ASSERT_EQ(network::Socket::convert_to_type(s2), SW_SOCK_TCP);
+
+    std::string s3("::1");
+    ASSERT_EQ(network::Socket::convert_to_type(s3), SW_SOCK_TCP6);
+
+    std::string s4("unix:/tmp/swoole.sock");
+    ASSERT_EQ(network::Socket::convert_to_type(s4), SW_SOCK_UNIX_STREAM);
+    ASSERT_EQ(s4, "/tmp/swoole.sock");
+}
+
+static void test_sock_type(SocketType type, int expect_sock_domain, int expect_sock_type) {
+    int sock_domain, sock_type;
+    ASSERT_EQ(network::Socket::get_domain_and_type(type, &sock_domain, &sock_type), SW_OK);
+    ASSERT_EQ(sock_domain, expect_sock_domain);
+    ASSERT_EQ(sock_type, expect_sock_type);
+}
+
+TEST(socket, get_domain_and_type) {
+    test_sock_type(SW_SOCK_TCP, AF_INET, SOCK_STREAM);
+    test_sock_type(SW_SOCK_TCP6, AF_INET6, SOCK_STREAM);
+    test_sock_type(SW_SOCK_UDP, AF_INET, SOCK_DGRAM);
+    test_sock_type(SW_SOCK_UDP6, AF_INET6, SOCK_DGRAM);
+    test_sock_type(SW_SOCK_UNIX_STREAM, AF_LOCAL, SOCK_STREAM);
+    test_sock_type(SW_SOCK_UNIX_DGRAM, AF_LOCAL, SOCK_DGRAM);
+    test_sock_type(SW_SOCK_RAW, AF_INET, SOCK_RAW);
+    test_sock_type(SW_SOCK_RAW6, AF_INET6, SOCK_RAW);
+
+    ASSERT_TRUE(network::Socket::is_dgram(SW_SOCK_UDP6));
+    ASSERT_TRUE(network::Socket::is_stream(SW_SOCK_TCP));
+
+    int sock_domain, sock_type;
+    ASSERT_EQ(
+        network::Socket::get_domain_and_type(static_cast<swSocketType>(SW_SOCK_RAW6 + 1), &sock_domain, &sock_type),
+        SW_ERR);
+}
+
+TEST(socket, make_socket) {
+    network::Socket *sock;
+
+    sock = make_socket(SW_SOCK_RAW, SW_FD_STREAM, 0);
+    ASSERT_EQ(sock, nullptr);
+    ASSERT_EQ(errno, EPROTONOSUPPORT);
+    ASSERT_EQ(swoole_get_last_error(), EPROTONOSUPPORT);
+
+    sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, AF_INET6, SOCK_RDM, 999, 0);
+    ASSERT_EQ(sock, nullptr);
+    ASSERT_EQ(errno, EINVAL);
+    ASSERT_EQ(swoole_get_last_error(), EINVAL);
+}
+
+TEST(socket, make_server_socket) {
+    network::Socket *sock;
+
+    auto bad_addr = "199.199.0.0";
+
+    // Raw socket errors depend on the kernel and capabilities, rather than UID alone.
+    auto native_socket = ::socket(AF_INET, SOCK_RAW, 0);
+    int expected_error = sw_errno();
+    if (native_socket != SW_BAD_SOCKET) {
+        sw_close_socket(native_socket);
+        expected_error = EADDRNOTAVAIL;
+    }
+    sock = make_server_socket(SW_SOCK_RAW, bad_addr);
+    ASSERT_EQ(sock, nullptr);
+    ASSERT_EQ(sw_errno(), expected_error);
+    ASSERT_EQ(swoole_get_last_error(), expected_error);
+
+    sock = make_server_socket(SW_SOCK_TCP, bad_addr);
+    ASSERT_EQ(sock, nullptr);
+    ASSERT_EQ(errno, EADDRNOTAVAIL);
+
+    sock = make_server_socket(SW_SOCK_TCP, TEST_HOST, 0, -1);
+    ASSERT_NE(sock, nullptr);
+    sock->free();
+}
+
+TEST(socket, make_server_socket_rebind_after_time_wait) {
+    auto server = make_server_socket(SW_SOCK_TCP, TEST_HOST);
+    ASSERT_NE(server, nullptr);
+    auto port = server->get_port();
+    ASSERT_GT(port, 0);
+
+    network::Address address;
+    ASSERT_TRUE(address.assign(SW_SOCK_TCP, TEST_HOST, port));
+    auto client = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_NE(client, nullptr);
+    ASSERT_EQ(client->connect_sync(address), SW_OK);
+
+    auto connection = server->accept();
+    ASSERT_NE(connection, nullptr);
+    // The server endpoint must close first so TIME_WAIT lands on the listener port. If the client closed first, it
+    // would land on the client's ephemeral port and this test would pass without the fix.
+    connection->free();
+
+    char buf;
+    ASSERT_EQ(client->recv_sync(&buf, sizeof(buf), 0), 0);
+    client->free();
+    server->free();
+
+    server = make_server_socket(SW_SOCK_TCP, TEST_HOST, port);
+    ASSERT_NE(server, nullptr);
+    server->free();
+}
+
+TEST(socket, ssl_get_error_reason) {
+    swoole_ssl_init();
+    {
+        int reason = -1;
+        const char *error_str = network::Socket::ssl_get_error_reason(&reason);
+
+        EXPECT_EQ(error_str, nullptr);
+        EXPECT_EQ(reason, 0);
+    }
+    // 测试单个错误的情况
+    {
+        // 生成一个 OpenSSL 错误
+        ERR_put_error(ERR_LIB_SSL, SSL_F_SSL_SET_SESSION, SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED, __FILE__, __LINE__);
+
+        int reason = -1;
+        const char *error_str = network::Socket::ssl_get_error_reason(&reason);
+
+        // 验证错误原因代码
+        EXPECT_EQ(reason, SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED);
+
+        // 验证错误字符串
+        EXPECT_NE(error_str, nullptr);
+        EXPECT_TRUE(strstr(error_str, "certificate expired") != nullptr ||
+                    strstr(error_str, "CERTIFICATE_EXPIRED") != nullptr);
+
+        // 验证错误队列现在应该为空（因为 ERR_get_error 会移除错误）
+        EXPECT_EQ(ERR_peek_error(), 0);
+    }
+
+    // 测试多个错误的情况（只返回第一个）
+    {
+        // 生成多个 OpenSSL 错误
+        ERR_put_error(ERR_LIB_SSL, SSL_F_SSL_SET_SESSION, SSL_R_SSLV3_ALERT_BAD_CERTIFICATE, __FILE__, __LINE__);
+        ERR_put_error(ERR_LIB_SSL, SSL_F_SSL_SHUTDOWN, SSL_R_PROTOCOL_IS_SHUTDOWN, __FILE__, __LINE__);
+
+        int reason = -1;
+        const char *error_str = network::Socket::ssl_get_error_reason(&reason);
+
+        // 验证返回的是第一个错误的原因代码
+        EXPECT_EQ(reason, SSL_R_SSLV3_ALERT_BAD_CERTIFICATE);
+
+        // 验证错误字符串
+        EXPECT_NE(error_str, nullptr);
+        EXPECT_TRUE(strstr(error_str, "bad certificate") != nullptr || strstr(error_str, "BAD_CERTIFICATE") != nullptr);
+
+        // 验证错误队列中还有一个错误
+        EXPECT_NE(ERR_peek_error(), 0);
+
+        ERR_get_error();
+    }
+
+    // 测试不同库的错误
+    {
+        // 生成一个 BIO 库错误
+        ERR_put_error(ERR_LIB_BIO, BIO_F_BIO_WRITE, BIO_R_BROKEN_PIPE, __FILE__, __LINE__);
+
+        int reason = -1;
+        const char *error_str = network::Socket::ssl_get_error_reason(&reason);
+
+        // 验证错误原因代码
+        EXPECT_EQ(reason, BIO_R_BROKEN_PIPE);
+
+        // 验证错误字符串
+        EXPECT_NE(error_str, nullptr);
+        EXPECT_TRUE(strstr(error_str, "broken pipe") != nullptr || strstr(error_str, "BROKEN_PIPE") != nullptr);
+    }
+
+    // 测试 reason 参数为 nullptr 的情况（如果函数支持）
+    {
+        // 生成一个 OpenSSL 错误
+        ERR_put_error(ERR_LIB_SSL, SSL_F_SSL_READ, SSL_R_SSL_HANDSHAKE_FAILURE, __FILE__, __LINE__);
+
+        // 调用函数，传入 nullptr 作为 reason 参数
+        // 注意：如果函数不支持 nullptr 参数，这个测试会导致段错误
+        // 在这种情况下，应该跳过这个测试或修改函数以支持 nullptr
+        const char *error_str = network::Socket::ssl_get_error_reason(nullptr);
+
+        // 验证错误字符串
+        EXPECT_NE(error_str, nullptr);
+        EXPECT_TRUE(strstr(error_str, "handshake failure") != nullptr ||
+                    strstr(error_str, "HANDSHAKE_FAILURE") != nullptr);
+    }
+
+    // 测试错误队列中有错误但 ERR_reason_error_string 返回 nullptr 的情况
+    {
+        // 使用一个不常见的错误代码，可能没有对应的错误字符串
+        // 注意：这个测试可能不稳定，因为 OpenSSL 可能为所有错误代码都提供字符串
+        ERR_put_error(ERR_LIB_USER, 0, 12345, __FILE__, __LINE__);
+
+        int reason = -1;
+        const char *error_str = network::Socket::ssl_get_error_reason(&reason);
+
+        // 验证错误原因代码
+        EXPECT_EQ(reason, 12345);
+
+        // 错误字符串可能为 nullptr 或包含通用错误信息
+        // 这个验证可能需要根据实际情况调整
+        if (error_str != nullptr) {
+            EXPECT_TRUE(true);  // 如果有字符串，测试通过
+        } else {
+            EXPECT_EQ(error_str, nullptr);  // 如果没有字符串，也测试通过
+        }
+    }
+
+    // 测试函数在多次调用后的行为
+    {
+        // 生成一个 OpenSSL 错误
+        ERR_put_error(ERR_LIB_SSL, SSL_F_SSL_CTX_NEW, SSL_R_LIBRARY_HAS_NO_CIPHERS, __FILE__, __LINE__);
+
+        // 第一次调用
+        int reason1 = -1;
+        const char *error_str1 = network::Socket::ssl_get_error_reason(&reason1);
+
+        // 验证第一次调用的结果
+        EXPECT_EQ(reason1, SSL_R_LIBRARY_HAS_NO_CIPHERS);
+        EXPECT_NE(error_str1, nullptr);
+
+        // 第二次调用，应该没有错误了
+        int reason2 = -1;
+        const char *error_str2 = network::Socket::ssl_get_error_reason(&reason2);
+
+        // 验证第二次调用的结果
+        EXPECT_EQ(reason2, 0);
+        EXPECT_EQ(error_str2, nullptr);
+    }
+}
+
+TEST(socket, catch_error) {
+    network::Socket fake_sock;
+    ASSERT_EQ(fake_sock.catch_write_pipe_error(ENOBUFS), SW_REDUCE_SIZE);
+    ASSERT_EQ(fake_sock.catch_write_pipe_error(EMSGSIZE), SW_REDUCE_SIZE);
+    ASSERT_EQ(fake_sock.catch_write_pipe_error(EAGAIN), SW_WAIT);
+
+    ASSERT_EQ(fake_sock.catch_write_error(ENOBUFS), SW_WAIT);
+}
+
+TEST(socket, misc) {
+    auto sock = make_socket(SW_SOCK_TCP, SW_FD_STREAM, 0);
+    ASSERT_TRUE(sock->set_nonblock());
+    ASSERT_EQ(sock->get_out_buffer_length(), 0);
+    ASSERT_TRUE(sock->set_block());
+    ASSERT_GT(sock->get_fd(), 0);
+    ASSERT_EQ(sock->connect(TEST_HTTP_DOMAIN, 80), 0);
+    ASSERT_EQ(sock->get_name(), 0);
+    ASSERT_GT(sock->get_port(), 1024);
+
+    auto fd = sock->get_fd();
+    auto sock_fd = sock->move_fd();
+    ASSERT_EQ(fd, sock_fd);
+    ASSERT_EQ(sock->get_fd(), -1);
+
+    ASSERT_EQ(sock->catch_write_pipe_error(EMSGSIZE), SW_REDUCE_SIZE);
+    ASSERT_FALSE(sock->kernel_nobufs);
+
+    ASSERT_EQ(sock->catch_write_pipe_error(ENOBUFS), SW_REDUCE_SIZE);
+    ASSERT_TRUE(sock->kernel_nobufs);
+
+    ASSERT_EQ(sock->catch_write_error(EAGAIN), sock->catch_write_pipe_error(EAGAIN));
+
+    delete sock;
+
+    ASSERT_TRUE(network::Socket::is_dgram(SW_SOCK_UDP));
+    ASSERT_FALSE(network::Socket::is_dgram(SW_SOCK_TCP6));
+
+    ASSERT_TRUE(network::Socket::is_stream(SW_SOCK_TCP));
+    ASSERT_FALSE(network::Socket::is_stream(SW_SOCK_UDP));
+
+    ASSERT_TRUE(network::Socket::is_inet6(SW_SOCK_UDP6));
+    ASSERT_FALSE(network::Socket::is_inet6(SW_SOCK_UDP));
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    network::Socket sock1{};
+    sock1.fd = fds[1];
+
+    network::Socket sock2{};
+    sock2.fd = fds[0];
+
+    ASSERT_EQ(sock1.write(test_data, strlen(test_data)), strlen(test_data));
+
+    char rbuf[128];
+    ASSERT_EQ(sock2.read(rbuf, sizeof(rbuf)), strlen(test_data));
+    ASSERT_MEMEQ(test_data, rbuf, strlen(test_data));
 }

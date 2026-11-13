@@ -1,21 +1,25 @@
 ARG PHP_VERSION
 ARG ALPINE_VERSION
 
-FROM hyperf/hyperf:${PHP_VERSION}-alpine-v${ALPINE_VERSION}-dev
+FROM phpswoole/php:${PHP_VERSION}-alpine
 
-LABEL maintainer="Swoole Team <team@swoole.com>" version="1.0" license="MIT"
+LABEL maintainer="Swoole Team <team@swoole.com>" version="1.0" license="Apache2"
 
-COPY . /opt/www
+ARG PHP_VERSION
 
-WORKDIR /opt/www
+COPY . /swoole
+
+WORKDIR /swoole
+
+RUN apk add liburing-dev
 
 RUN set -ex \
     && phpize \
-    && ./configure --enable-openssl --enable-http2 --enable-swoole-curl --enable-swoole-json \
-    && make -s -j$(nproc) && make install \
-    && echo "extension=swoole.so" > /etc/php7/conf.d/50_swoole.ini \
-    # check
-    && php -v \
-    && php -m \
-    && php --ri swoole \
-    && echo -e "\033[42;37m Build Completed :).\033[0m\n"
+    && ./configure --enable-swoole-curl --enable-iouring \
+    && make -s -j$(nproc) && make install
+
+RUN echo "extension=swoole.so" > "/usr/local/etc/php/conf.d/swoole.ini"
+RUN php -v
+RUN php -m
+RUN php --ri swoole
+RUN echo -e "\033[42;37m Build Completed :).\033[0m\n"

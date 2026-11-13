@@ -1,7 +1,9 @@
 --TEST--
 swoole_coroutine_scheduler/preemptive: for
 --SKIPIF--
-<?php require __DIR__ . '/../../include/skipif.inc';
+<?php
+require __DIR__ . '/../../include/skipif.inc';
+skip_if_not_linux();
 ?>
 --FILE--
 <?php
@@ -35,7 +37,7 @@ go(function () use (&$flag) {
     $flag = false;
 });
 echo "end\n";
-swoole_event::wait();
+Swoole\Event::wait();
 ?>
 --EXPECTF--
 start

@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -18,15 +18,20 @@
 #define SW_SOCKET_HOOK_H_
 
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <unistd.h>
 #include <sys/socket.h>
 #include <poll.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "swoole_coroutine_c_api.h"
+#include "swoole_coroutine_api.h"
 
 #define socket(domain, type, protocol) swoole_coroutine_socket(domain, type, protocol)
 #define send(sockfd, buf, len, flags) swoole_coroutine_send(sockfd, buf, len, flags)
@@ -35,7 +40,12 @@ extern "C" {
 #define recv(sockfd, buf, len, flags) swoole_coroutine_recv(sockfd, buf, len, flags)
 #define close(fd) swoole_coroutine_close(fd)
 #define connect(sockfd, addr, addrlen) swoole_coroutine_connect(sockfd, addr, addrlen)
+#define accept(sockfd, addr, addrlen) swoole_coroutine_accept(sockfd, addr, addrlen)
+#ifdef SW_HOOK_POLL_FAKE
+#define poll(fds, nfds, timeout) swoole_coroutine_poll_fake(fds, nfds, timeout)
+#else
 #define poll(fds, nfds, timeout) swoole_coroutine_poll(fds, nfds, timeout)
+#endif
 #define sendmsg(sockfd, msg, flags) swoole_coroutine_sendmsg(sockfd, msg, flags)
 #define recvmsg(sockfd, msg, flags) swoole_coroutine_recvmsg(sockfd, msg, flags)
 #define getaddrinfo(name, service, req, pai) swoole_coroutine_getaddrinfo(name, service, req, pai)

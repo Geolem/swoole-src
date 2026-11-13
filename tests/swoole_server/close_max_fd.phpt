@@ -9,78 +9,84 @@ require __DIR__ . '/../include/bootstrap.php';
 use Swoole\Server;
 
 $pm = new SwooleTest\ProcessManager;
+$pm->setWaitTimeout(5);
 $pm->parentFunc = function () use ($pm) {
     Co\run(function () use ($pm) {
-        go(function() use ($pm) {
-            $client = new Co\Client(SWOOLE_SOCK_TCP);
-            Assert::assert($client->connect('127.0.0.1', $pm->getFreePort()));
-            Assert::assert($client->send('test'));
-            $client->recv();
-            Co::sleep(2);
-            $client->send('ping');
-            Co::sleep(2);
-            $pm->kill();
-        });
-        go(function() use ($pm) {
-            $cli = new Co\Http\Client('127.0.0.1', $pm->getFreePort());
-        });
-        go(function() use ($pm) {
-            $client = new Co\Client(SWOOLE_SOCK_TCP);
-            Assert::assert($client->connect('127.0.0.1', $pm->getFreePort()));
-            $client->send('test2');
-        });
+        $client1 = new Co\Client(SWOOLE_SOCK_TCP);
+        Assert::true($client1->connect('127.0.0.1', $pm->getFreePort()));
+
+        $httpClient = new Co\Http\Client('127.0.0.1', $pm->getFreePort());
+        unset($httpClient);
+
+        $client2 = new Co\Client(SWOOLE_SOCK_TCP);
+        Assert::true($client2->connect('127.0.0.1', $pm->getFreePort()));
+
+        Assert::same($client1->send('test 1'), 6);
+        Assert::same($client1->recv(), 'Server: test 1');
+        Assert::same($client2->send('test 2'), 6);
+        Assert::same($client2->recv(), 'Server: test 2');
+
+        Assert::true($client2->close());
+        Assert::true($pm->wait());
+
+        Assert::same($client1->send('ping 1'), 6);
+        Assert::same($client1->recv(), 'Server: ping 1');
+        Assert::true($client1->close());
+        Assert::true($pm->wait());
     });
+    $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
-    $server = new Swoole\Server('127.0.0.1', $pm->getFreePort());
+    $log_file = __DIR__ . '/close_max_fd.log';
+    $fp = fopen($log_file, 'w');
+    $server = new Swoole\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $server->set([
         'worker_num' => 1,
         'log_level' => SWOOLE_LOG_ERROR,
     ]);
 
-    $server->on('receive', function (Swoole\Server $serv, int $fd, int $rid, string $data) {
-        var_dump($data);
-        var_dump($serv->getClientList());
+    $server->on('workerStart', function () use ($pm) {
+        $pm->wakeup();
+    });
+
+    $server->on('receive', function (Swoole\Server $serv, int $fd, int $rid, string $data) use ($fp) {
+        fputs($fp, "recv: $data\n");
+        fputs($fp, 'getClientList: ' . implode(';', $serv->getClientList()) . "\n");
         Assert::true(!empty($serv->getClientList()));
         foreach ($serv->connections as $_fd) {
-            var_dump("fd:{$_fd}");
+            fputs($fp, "foreach: fd-{$_fd}\n");
         }
+        fflush($fp);
         $serv->send($fd, "Server: " . $data);
     });
 
-    $server->on('Close', function ($server, $fd) {
-        echo "Client:{$fd} Close.\n";
+    $server->on('close', function ($server, $fd) use ($pm, $fp) {
+        fputs($fp, "close: fd-{$fd}\n");
+        fflush($fp);
+        $pm->wakeup();
     });
 
     $server->start();
+
+    fclose($fp);
+    $cnt = file_get_contents($log_file);
+
+    Assert::eq(substr_count($cnt, 'recv: test 1'), 1);
+    Assert::eq(substr_count($cnt, 'recv: test 2'), 1);
+    Assert::eq(substr_count($cnt, 'recv: ping 1'), 1);
+
+    Assert::eq(substr_count($cnt, 'close: fd-2'), 1);
+    Assert::eq(substr_count($cnt, 'close: fd-1'), 1);
+
+    Assert::eq(substr_count($cnt, 'foreach: fd-1'), 3);
+    Assert::eq(substr_count($cnt, 'foreach: fd-2'), 2);
+
+    Assert::eq(substr_count($cnt, 'getClientList: 1;2'), 2);
+    Assert::eq(substr_count($cnt, "getClientList: 1\n"), 1);
+
+    unlink($log_file);
 };
 $pm->childFirst();
 $pm->run();
 ?>
 --EXPECT--
-string(4) "test"
-array(2) {
-  [0]=>
-  int(1)
-  [1]=>
-  int(2)
-}
-string(4) "fd:1"
-string(4) "fd:2"
-string(5) "test2"
-array(2) {
-  [0]=>
-  int(1)
-  [1]=>
-  int(2)
-}
-string(4) "fd:1"
-string(4) "fd:2"
-Client:2 Close.
-string(4) "ping"
-array(1) {
-  [0]=>
-  int(1)
-}
-string(4) "fd:1"
-Client:1 Close.

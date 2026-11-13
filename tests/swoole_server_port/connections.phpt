@@ -1,100 +1,76 @@
 --TEST--
 swoole_server_port: connections
 --SKIPIF--
-<?php require  __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
 use Swoole\Constant;
+use Swoole\Coroutine\Http\Client;
+use Swoole\Coroutine\Scheduler;
+use Swoole\WebSocket\Server;
+use SwooleTest\ProcessManager;
 
-$pm = new SwooleTest\ProcessManager;
+$pm = new ProcessManager();
 $pm->initFreePorts(2);
 
 $pm->parentFunc = function ($pid) use ($pm) {
-    $sch = new \Co\Scheduler();
-    $sch->parallel(
-        3,
-        function () use ($pm) {
-            $c = new Swoole\Coroutine\Http\Client(TCP_SERVER_HOST, $pm->getFreePort(0));
-            $c->upgrade('/');
-            $c->recv();
-        }
-    );
-    $sch->parallel(
-        2,
-        function () use ($pm) {
-            $c = new Swoole\Coroutine\Http\Client(TCP_SERVER_HOST, $pm->getFreePort(1));
-            $c->upgrade('/');
-            $c->recv();
-        }
-    );
+    $sch = new Scheduler();
+    $ready = new Swoole\Coroutine\Channel(8);
+    $release = new Swoole\Coroutine\Channel(1);
+    $clients = [];
+    $conns = [[], []];
 
-    //all
-    $sch->add(
-        function () use ($pm) {
-            $c = new Swoole\Coroutine\Http\Client(TCP_SERVER_HOST, $pm->getFreePort(0));
-            $c->upgrade('/');
-            $c->push('all');
-            $frame = $c->recv();
-            Assert::assert($frame);
-            $json = json_decode($frame->data);
-            Assert::eq($json->count, 8);
-            Assert::eq($json->list, range(1, 8));
-        }
-    );
-
-    //port-0
-    $sch->add(
-        function () use ($pm) {
-            $c = new Swoole\Coroutine\Http\Client(TCP_SERVER_HOST, $pm->getFreePort(0));
-            $c->upgrade('/');
-            $c->push('port-0');
-            $frame = $c->recv();
-            Assert::assert($frame);
-            $json = json_decode($frame->data);
-            Assert::eq($json->count, 5);
-            Assert::eq($json->list, [1,2,3,6,7]);
-        }
-    );
-
-    //port-1
-    $sch->add(
-        function () use ($pm) {
-            $c = new Swoole\Coroutine\Http\Client(TCP_SERVER_HOST, $pm->getFreePort(1));
-            $c->upgrade('/');
-            $c->push('port-1');
-            $frame = $c->recv();
-            Assert::assert($frame);
-            $json = json_decode($frame->data);
-            Assert::eq($json->count, 3);
-            Assert::eq($json->list, [4,5,8]);
-        }
-    );
-
-    $sch->add(
-        function () use ($pm) {
-            \Co\System::sleep(.5);
+    foreach ([0, 0, 0, 1, 1, 0, 0, 1] as $index => $port) {
+        $sch->add(function () use ($pm, $ready, $release, &$clients, &$conns, $index, $port) {
+            $client = new Client(TCP_SERVER_HOST, $pm->getFreePort($port));
+            Assert::true($client->upgrade('/'));
+            $frame = $client->recv();
+            Assert::true($frame !== false);
+            $conns[$port][] = $frame->data;
+            $clients[$index] = $client;
+            $ready->push(true);
+            // Keep every connection alive until all three iterator checks finish.
+            $release->pop();
+            $client->close();
+        });
+    }
+    $sch->add(function () use ($pm, $ready, $release, &$clients, &$conns) {
+        try {
+            for ($i = 0; $i < 8; $i++) {
+                Assert::true($ready->pop(5));
+            }
+            $queries = [
+                [5, 'all', array_merge($conns[0], $conns[1])],
+                [6, 'port-0', $conns[0]],
+                [7, 'port-1', $conns[1]],
+            ];
+            foreach ($queries as [$index, $query, $expected]) {
+                Assert::true($clients[$index]->push($query));
+                $frame = $clients[$index]->recv();
+                Assert::true($frame !== false);
+                $result = json_decode($frame->data);
+                Assert::eq($result->count, count($expected));
+                Assert::eq(array_arrange($result->list), array_arrange($expected));
+            }
+        } finally {
+            $release->close();
             $pm->kill();
         }
-    );
+    });
     $sch->start();
 };
 
-$pm->childFunc = function () use ($pm)
-{
-    $server = new Swoole\WebSocket\Server("0.0.0.0", $pm->getFreePort(0));
-    $server->set(
-        [
-            Constant::OPTION_LOG_FILE => '/dev/null',
-            Constant::OPTION_WORKER_NUM => 1,
-        ]
-    );
-    $server->on(
-        'open',
-        function (Swoole\WebSocket\Server $server, $request) {
-        }
-    );
+$pm->childFunc = function () use ($pm) {
+    $server = new Server('0.0.0.0', $pm->getFreePort(0), SWOOLE_PROCESS);
+    $server->set([
+        Constant::OPTION_LOG_FILE => '/dev/null',
+        Constant::OPTION_WORKER_NUM => 1,
+    ]);
+    $server->on('open', function (Server $server, $request) {
+        $server->push($request->fd, $request->fd);
+    });
     $server->on(
         Constant::EVENT_WORKER_START,
         function () use ($pm) {
@@ -106,7 +82,7 @@ $pm->childFunc = function () use ($pm)
 
     $server->on(
         'message',
-        function (Swoole\WebSocket\Server $server, $frame) {
+        function (Server $server, $frame) {
             if ($frame->data == 'all') {
                 $iterator = $server->connections;
             } elseif ($frame->data == 'port-0') {
@@ -123,8 +99,7 @@ $pm->childFunc = function () use ($pm)
         }
     );
 
-    $server->on('close', function ($ser, $fd) {
-    });
+    $server->on('close', function ($ser, $fd) {});
 
     $server->start();
 };

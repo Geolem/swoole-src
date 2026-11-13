@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_lock.h"
 
 namespace swoole {
@@ -51,25 +50,25 @@ struct Channel {
     Lock *lock;
     Pipe *notify_pipe;
 
-    inline bool empty() {
+    bool empty() const {
         return num == 0;
     }
-    inline bool full() {
+    bool full() const {
         return ((head == tail && tail_tag != head_tag) || (bytes + sizeof(int) * num == size));
     }
     int pop(void *out_buf, int buffer_length);
     int push(const void *in_data, int data_length);
     int out(void *out_buf, int buffer_length);
     int in(const void *in_data, int data_length);
-    int peek(void *out, int buffer_length);
-    int wait();
-    int notify();
+    int peek(void *out, int buffer_length) const;
+    int wait() const;
+    int notify() const;
     void destroy();
-    void print();
-    inline int count() {
+    void print() const;
+    int count() const {
         return num;
     }
-    inline int get_bytes() {
+    size_t get_bytes() const {
         return bytes;
     }
     static Channel *make(size_t size, size_t maxlen, int flags);

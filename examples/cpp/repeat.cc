@@ -21,16 +21,16 @@ int main(int argc, char **argv) {
 
         serv.onPacket = [](Server *serv, RecvData *req) { return SW_OK; };
 
-        serv.onWorkerStart = [](Server *serv, int worker_id) {
-            swNotice("WorkerStart[%d]PID=%d, serv=%p,", worker_id, getpid(), serv);
+        serv.onWorkerStart = [](Server *serv, Worker *worker) {
+            swoole_notice("WorkerStart[%d]PID=%d, serv=%p,", worker->id, getpid(), serv);
             swoole_timer_after(
                 1000,
                 [serv](Timer *, TimerNode *tnode) {
                     printf("timer=%p\n", tnode);
                     if (serv->is_base_mode()) {
-                        kill(getpid(), SIGTERM);
+                        sw_kill(getpid(), SIGTERM);
                     } else {
-                        kill(serv->gs->master_pid, SIGTERM);
+                        sw_kill(serv->gs->master_pid, SIGTERM);
                     }
                 },
                 nullptr);
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
 
         ListenPort *port = serv.add_port(SW_SOCK_TCP, "127.0.0.1", 9501);
         if (!port) {
-            swWarn("listen failed, [error=%d]", swoole_get_last_error());
+            swoole_warning("listen failed, [error=%d]", swoole_get_last_error());
             exit(2);
         }
 
@@ -52,12 +52,12 @@ int main(int argc, char **argv) {
         memcpy(port->protocol.package_eof, SW_STRL("\r\n\r\n"));
 
         if (serv.create()) {
-            swWarn("create server fail[error=%d]", swoole_get_last_error());
+            swoole_warning("create server fail[error=%d]", swoole_get_last_error());
             exit(1);
         }
 
         if (serv.start() < 0) {
-            swWarn("start server fail[error=%d]", swoole_get_last_error());
+            swoole_warning("start server fail[error=%d]", swoole_get_last_error());
             exit(3);
         }
     }

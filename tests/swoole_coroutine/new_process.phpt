@@ -1,7 +1,7 @@
 --TEST--
 swoole_coroutine: new process
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc'; skip_if_win(); ?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
@@ -14,5 +14,5 @@ go(function () {
 Fatal error: Uncaught Swoole\Error: must be forked outside the coroutine in %s:%d
 Stack trace:
 #0 %s(5): Swoole\Process->start()
-#1 {main}
+%A
   thrown in %s on line %d

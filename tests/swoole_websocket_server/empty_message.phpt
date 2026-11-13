@@ -7,8 +7,6 @@ require __DIR__ . '/../include/skipif.inc'; ?>
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 $pm = new SwooleTest\ProcessManager;
-$pm->useConstantPorts = true;
-$pm->initFreePorts();
 
 $pm->parentFunc = function (int $pid) use ($pm) {
     go(function() use ($pm) {
@@ -21,11 +19,11 @@ $pm->parentFunc = function (int $pid) use ($pm) {
         $json = json_decode($response->data);
         Assert::isEmpty($json->data);
     });
-    swoole_event::wait();
+    Swoole\Event::wait();
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
+    $serv = new Swoole\WebSocket\Server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
     $serv->set([
         // 'worker_num' => 1,
         'log_file' => '/dev/null'
@@ -33,9 +31,9 @@ $pm->childFunc = function () use ($pm) {
     $serv->on('WorkerStart', function () use ($pm) {
         $pm->wakeup();
     });
-    $serv->on('open', function (swoole_websocket_server $serv, swoole_http_request $req) {
+    $serv->on('open', function (Swoole\WebSocket\Server  $serv, Swoole\Http\Request $req) {
     });
-    $serv->on('Message', function (swoole_websocket_server $serv, swoole_websocket_frame $frame) {
+    $serv->on('Message', function (Swoole\WebSocket\Server  $serv, Swoole\WebSocket\Frame $frame) {
         $serv->push($frame->fd, json_encode($frame));
     });
     $serv->start();

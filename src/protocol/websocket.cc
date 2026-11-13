@@ -10,25 +10,39 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
-#include "swoole.h"
 #include "swoole_server.h"
 #include "swoole_websocket.h"
 
-using swoole::Server;
+#include <limits>
+
 using swoole::Connection;
-using swoole::String;
 using swoole::Protocol;
+using swoole::Server;
+using swoole::String;
 using swoole::network::Socket;
 
-static inline uint16_t swWebSocket_get_ext_flags(uchar opcode, uchar flags) {
-    uint16_t ext_flags = opcode;
-    ext_flags = ext_flags << 8;
-    ext_flags += flags;
-    return ext_flags;
+namespace swoole {
+namespace websocket {
+static inline uint16_t load_uint16(const char *buf) {
+    uint16_t value;
+    memcpy(&value, buf, sizeof(value));
+    return value;
+}
+
+static inline uint32_t load_uint32(const char *buf) {
+    uint32_t value;
+    memcpy(&value, buf, sizeof(value));
+    return value;
+}
+
+static inline uint64_t load_uint64(const char *buf) {
+    uint64_t value;
+    memcpy(&value, buf, sizeof(value));
+    return value;
 }
 
 /*  The following is websocket data frame:
@@ -52,57 +66,65 @@ static inline uint16_t swWebSocket_get_ext_flags(uchar opcode, uchar flags) {
  |                     Payload Data continued ...                |
  +---------------------------------------------------------------+
  */
-
-ssize_t swWebSocket_get_package_length(Protocol *protocol, Socket *conn, const char *buf, uint32_t length) {
+static ssize_t get_package_length_impl(PacketLength *pl) {
     // need more data
-    if (length < SW_WEBSOCKET_HEADER_LEN) {
+    if (pl->buf_size < SW_WEBSOCKET_HEADER_LEN) {
         return 0;
     }
-
+    const char *buf = pl->buf;
     char mask = (buf[1] >> 7) & 0x1;
     // 0-125
     uint64_t payload_length = buf[1] & 0x7f;
-    size_t header_length = SW_WEBSOCKET_HEADER_LEN;
+    pl->header_len = SW_WEBSOCKET_HEADER_LEN;
     buf += SW_WEBSOCKET_HEADER_LEN;
 
     // uint16_t, 2byte
     if (payload_length == SW_WEBSOCKET_EXT16_LENGTH) {
-        header_length += sizeof(uint16_t);
-        if (length < header_length) {
-            protocol->real_header_length = header_length;
+        pl->header_len += sizeof(uint16_t);
+        if (pl->buf_size < pl->header_len) {
             return 0;
         }
-        payload_length = ntohs(*((uint16_t *) buf));
-        buf += sizeof(uint16_t);
+        payload_length = ntohs(load_uint16(buf));
     }
     // uint64_t, 8byte
     else if (payload_length == SW_WEBSOCKET_EXT64_LENGTH) {
-        header_length += sizeof(uint64_t);
-        if (length < header_length) {
-            protocol->real_header_length = header_length;
+        pl->header_len += sizeof(uint64_t);
+        if (pl->buf_size < pl->header_len) {
             return 0;
         }
-        payload_length = swoole_ntoh64(*((uint64_t *) buf));
-        buf += sizeof(uint64_t);
+        payload_length = swoole_ntoh64(load_uint64(buf));
     }
     if (mask) {
-        header_length += SW_WEBSOCKET_MASK_LEN;
-        if (length < header_length) {
-            protocol->real_header_length = header_length;
+        pl->header_len += SW_WEBSOCKET_MASK_LEN;
+        if (pl->buf_size < pl->header_len) {
             return 0;
         }
     }
-    swTraceLog(SW_TRACE_LENGTH_PROTOCOL, "header_length=%zu, payload_length=%u", header_length, payload_length);
-    return header_length + payload_length;
+    // The return value includes the header. Checking only the payload's sign still
+    // allows the addition below to overflow ssize_t, even on a 64-bit platform.
+    if (sw_unlikely(payload_length > static_cast<uint64_t>(std::numeric_limits<ssize_t>::max()) - pl->header_len)) {
+        return -1;
+    }
+    swoole_trace_log(
+        SW_TRACE_LENGTH_PROTOCOL, "header_length=%u, payload_length=%" PRIu64, pl->header_len, payload_length);
+
+    return (ssize_t) pl->header_len + (ssize_t) payload_length;
 }
 
-static sw_inline void swWebSocket_mask(char *data, size_t len, const char *mask_key) {
+ssize_t get_package_length(const Protocol *protocol, Socket *conn, PacketLength *pl) {
+    return get_package_length_impl(pl);
+}
+
+void mask(char *data, size_t len, const char *mask_key) {
     size_t n = len / 8;
-    uint64_t mask_key64 = ((uint64_t)(*((uint32_t *) mask_key)) << 32) | *((uint32_t *) mask_key);
+    uint32_t mask_value = load_uint32(mask_key);
+    uint64_t mask_key64 = ((uint64_t) mask_value << 32) | mask_value;
     size_t i;
 
     for (i = 0; i < n; i++) {
-        ((uint64_t *) data)[i] ^= mask_key64;
+        uint64_t block = load_uint64(data + i * sizeof(uint64_t));
+        block ^= mask_key64;
+        memcpy(data + i * sizeof(uint64_t), &block, sizeof(block));
     }
 
     for (i = n * 8; i < len; i++) {
@@ -110,30 +132,39 @@ static sw_inline void swWebSocket_mask(char *data, size_t len, const char *mask_
     }
 }
 
-bool swWebSocket_encode(String *buffer, const char *data, size_t length, char opcode, uint8_t _flags) {
+bool encode(String *buffer, const char *data, size_t length, uint8_t opcode, uint8_t _flags) {
+    if (sw_unlikely(is_control_frame(opcode) &&
+                    ((_flags & FLAG_FIN) == 0 || length > SW_WEBSOCKET_CONTROL_FRAME_PAYLOAD_MAX_LEN))) {
+        swoole_warning("invalid websocket control frame: opcode=%u, fin=%u, payload_length=%zu",
+                       opcode,
+                       !!(_flags & FLAG_FIN),
+                       length);
+        return false;
+    }
+
     int pos = 0;
     char frame_header[16];
-    swWebSocket_frame_header *header = (swWebSocket_frame_header *) frame_header;
-    header->FIN = !!(_flags & SW_WEBSOCKET_FLAG_FIN);
+    auto *header = (Header *) frame_header;
+    header->FIN = !!(_flags & FLAG_FIN);
     header->OPCODE = opcode;
-    header->RSV1 = !!(_flags & SW_WEBSOCKET_FLAG_RSV1);
+    header->RSV1 = !!(_flags & FLAG_RSV1);
     header->RSV2 = 0;
     header->RSV3 = 0;
-    header->MASK = !!(_flags & SW_WEBSOCKET_FLAG_MASK);
+    header->MASK = !!(_flags & FLAG_MASK);
     pos = 2;
 
-    if (length < 126) {
+    if (length < SW_WEBSOCKET_EXT16_LENGTH) {
         header->LENGTH = length;
-    } else if (length < 65536) {
+    } else if (length <= SW_WEBSOCKET_EXT16_MAX_LEN) {
         header->LENGTH = SW_WEBSOCKET_EXT16_LENGTH;
-        uint16_t *length_ptr = (uint16_t *) (frame_header + pos);
-        *length_ptr = htons(length);
-        pos += sizeof(*length_ptr);
+        uint16_t ext_length = htons(length);
+        memcpy(frame_header + pos, &ext_length, sizeof(ext_length));
+        pos += sizeof(ext_length);
     } else {
         header->LENGTH = SW_WEBSOCKET_EXT64_LENGTH;
-        uint64_t *length_ptr = (uint64_t *) (frame_header + pos);
-        *length_ptr = swoole_hton64(length);
-        pos += sizeof(*length_ptr);
+        uint64_t ext_length = swoole_hton64(length);
+        memcpy(frame_header + pos, &ext_length, sizeof(ext_length));
+        pos += sizeof(ext_length);
     }
     buffer->append(frame_header, pos);
     /**
@@ -141,17 +172,17 @@ bool swWebSocket_encode(String *buffer, const char *data, size_t length, char op
      */
     if (header->MASK) {
         buffer->append(SW_WEBSOCKET_MASK_DATA, SW_WEBSOCKET_MASK_LEN);
-        if (_flags & SW_WEBSOCKET_FLAG_ENCODE_HEADER_ONLY) {
-            return false;
+        if (_flags & FLAG_ENCODE_HEADER_ONLY) {
+            return true;
         }
         if (length > 0) {
             size_t offset = buffer->length;
             // Warn: buffer may be extended, string pointer will change
             buffer->append(data, length);
-            swWebSocket_mask(buffer->str + offset, length, SW_WEBSOCKET_MASK_DATA);
+            mask(buffer->str + offset, length, SW_WEBSOCKET_MASK_DATA);
         }
     } else {
-        if (length > 0 and !(_flags & SW_WEBSOCKET_FLAG_ENCODE_HEADER_ONLY)) {
+        if (length > 0 && !(_flags & FLAG_ENCODE_HEADER_ONLY)) {
             buffer->append(data, length);
         }
     }
@@ -159,50 +190,79 @@ bool swWebSocket_encode(String *buffer, const char *data, size_t length, char op
     return true;
 }
 
-bool swWebSocket_decode(swWebSocket_frame *frame, char *data, size_t length) {
-    memcpy(frame, data, SW_WEBSOCKET_HEADER_LEN);
-
-    // 0-125
-    size_t payload_length = frame->header.LENGTH;
-    uint8_t header_length = SW_WEBSOCKET_HEADER_LEN;
-    char *buf = data + SW_WEBSOCKET_HEADER_LEN;
-
-    // uint16_t, 2byte
-    if (frame->header.LENGTH == 0x7e) {
-        payload_length = ntohs(*((uint16_t *) buf));
-        header_length += 2;
-    }
-    // uint64_t, 8byte
-    else if (frame->header.LENGTH > 0x7e) {
-        payload_length = swoole_ntoh64(*((uint64_t *) buf));
-        header_length += 8;
+bool parse_frame(Frame *frame, const char *data, size_t length) {
+    // Validate the available bytes before reading even the fixed two-byte header.
+    // This also keeps truncated extended lengths, masks and payloads on one error path.
+    PacketLength pl{data, (uint32_t) length, 0};
+    ssize_t total_length = get_package_length_impl(&pl);
+    if (total_length <= 0 || length < (size_t) total_length) {
+        swoole_error_log(SW_LOG_WARNING,
+                         SW_ERROR_WEBSOCKET_INCOMPLETE_PACKET,
+                         "incomplete packet, expected length is %zu, actual length is %zu",
+                         total_length,
+                         length);
+        return false;
     }
 
-    if (payload_length == 0) {
-        frame->header_length = header_length;
-        frame->payload_length = 0;
+    frame->header.OPCODE = data[0] & 0xf;
+    frame->header.RSV1 = (data[0] >> 6) & 0x1;
+    frame->header.RSV2 = (data[0] >> 5) & 0x1;
+    frame->header.RSV3 = (data[0] >> 4) & 0x1;
+    frame->header.FIN = (data[0] >> 7) & 0x1;
+    frame->header.MASK = (data[1] >> 7) & 0x1;
+    frame->header.LENGTH = data[1] & 0x7f;
+
+    frame->payload_length = total_length - pl.header_len;
+    frame->header_length = pl.header_len;
+
+    /**
+     * A control frame must not be compressed(RFC 6455: the RSV1 bit must be 0 for control frames),
+     * rejecting such a frame here keeps it away from the permessage-deflate path, see RFC 7692.
+     */
+    if (sw_unlikely(is_control_frame(frame->header.OPCODE) &&
+                    (frame->header.RSV1 || !frame->header.FIN ||
+                     frame->payload_length > SW_WEBSOCKET_CONTROL_FRAME_PAYLOAD_MAX_LEN))) {
+        swoole_warning("invalid websocket control frame received: opcode=%u, rsv1=%u, fin=%u, payload_length=%zu",
+                       frame->header.OPCODE,
+                       frame->header.RSV1,
+                       frame->header.FIN,
+                       frame->payload_length);
+        return false;
+    }
+
+    swoole_trace_log(SW_TRACE_WEBSOCKET,
+                     "decode frame, payload_length=%ld, mask=%d, opcode=%d",
+                     frame->payload_length,
+                     frame->header.MASK,
+                     frame->header.OPCODE);
+
+    if (frame->payload_length == 0) {
         frame->payload = nullptr;
-
-        return true;
+    } else {
+        frame->payload = const_cast<char *>(data) + frame->header_length;
+        if (frame->header.MASK) {
+            memcpy(frame->mask_key, frame->payload - SW_WEBSOCKET_MASK_LEN, SW_WEBSOCKET_MASK_LEN);
+        }
     }
-
-    if (frame->header.MASK) {
-        memcpy(frame->mask_key, data + header_length, SW_WEBSOCKET_MASK_LEN);
-        header_length += SW_WEBSOCKET_MASK_LEN;
-        swWebSocket_mask(data + header_length, payload_length, frame->mask_key);
-    }
-
-    frame->payload = data + header_length;
-    frame->header_length = header_length;
-    frame->payload_length = payload_length;
 
     return true;
 }
 
-int swWebSocket_pack_close_frame(String *buffer, int code, char *reason, size_t length, uint8_t flags) {
+bool decode(Frame *frame, char *data, size_t length) {
+    if (!parse_frame(frame, data, length)) {
+        return false;
+    }
+
+    if (frame->header.MASK && frame->payload_length > 0) {
+        mask(frame->payload, frame->payload_length, frame->mask_key);
+    }
+
+    return true;
+}
+
+bool pack_close_frame(String *buffer, int code, const char *reason, size_t length, uint8_t flags) {
     if (sw_unlikely(length > SW_WEBSOCKET_CLOSE_REASON_MAX_LEN)) {
-        swWarn("the max length of close reason is %d", SW_WEBSOCKET_CLOSE_REASON_MAX_LEN);
-        return SW_ERR;
+        return false;
     }
 
     char payload[SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CLOSE_CODE_LEN + SW_WEBSOCKET_CLOSE_REASON_MAX_LEN];
@@ -211,48 +271,55 @@ int swWebSocket_pack_close_frame(String *buffer, int code, char *reason, size_t 
     if (length > 0) {
         memcpy(payload + SW_WEBSOCKET_CLOSE_CODE_LEN, reason, length);
     }
-    flags |= SW_WEBSOCKET_FLAG_FIN;
-    swWebSocket_encode(buffer, payload, SW_WEBSOCKET_CLOSE_CODE_LEN + length, WEBSOCKET_OPCODE_CLOSE, flags);
-    return SW_OK;
+    flags |= FLAG_FIN;
+    if (!encode(buffer, payload, SW_WEBSOCKET_CLOSE_CODE_LEN + length, OPCODE_CLOSE, flags)) {
+        return false;
+    }
+    return true;
 }
 
-void swWebSocket_print_frame(swWebSocket_frame *frame) {
-    printf("FIN: %x, RSV1: %d, RSV2: %d, RSV3: %d, opcode: %d, MASK: %d, length: %ld\n",
-           frame->header.FIN,
-           frame->header.RSV1,
-           frame->header.RSV2,
-           frame->header.RSV3,
-           frame->header.OPCODE,
-           frame->header.MASK,
-           frame->payload_length);
+void print_frame(const Frame *frame) {
+    sw_printf("FIN: %x, RSV1: %d, RSV2: %d, RSV3: %d, opcode: %d, MASK: %d, length: %ld\n",
+              frame->header.FIN,
+              frame->header.RSV1,
+              frame->header.RSV2,
+              frame->header.RSV3,
+              frame->header.OPCODE,
+              frame->header.MASK,
+              frame->payload_length);
 
     if (frame->payload_length) {
-        printf("payload: %.*s\n", (int) frame->payload_length, frame->payload);
+        sw_printf("payload: %.*s\n", (int) frame->payload_length, frame->payload);
     }
 }
 
-int swWebSocket_dispatch_frame(Protocol *proto, Socket *_socket, const char *data, uint32_t length) {
-    Server *serv = (Server *) proto->private_data_2;
-    Connection *conn = (Connection *) _socket->object;
-
-    String send_frame = {};
-    char buf[SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CLOSE_CODE_LEN + SW_WEBSOCKET_CLOSE_REASON_MAX_LEN];
+#ifndef _WIN32
+int dispatch_frame(const Protocol *proto, Socket *_socket, const RecvData *rdata) {
+    auto *serv = (Server *) proto->private_data_2;
+    auto *conn = (Connection *) _socket->object;
+    RecvData dispatch_data{};
+    String send_frame{};
+    const char *data = rdata->data;
+    const uint32_t length = rdata->info.len;
+    char buf[SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CONTROL_FRAME_PAYLOAD_MAX_LEN];
     send_frame.str = buf;
     send_frame.size = sizeof(buf);
 
-    swWebSocket_frame ws;
-    swWebSocket_decode(&ws, const_cast<char *>(data), length);
+    Frame ws;
+    if (!decode(&ws, const_cast<char *>(data), length)) {
+        return SW_ERR;
+    }
 
     String *frame_buffer;
     int frame_length;
-    swListenPort *port;
+    ListenPort *port;
 
     size_t offset;
     switch (ws.header.OPCODE) {
-    case WEBSOCKET_OPCODE_CONTINUATION:
+    case OPCODE_CONTINUATION:
         frame_buffer = conn->websocket_buffer;
         if (frame_buffer == nullptr) {
-            swWarn("bad frame[opcode=0]. remote_addr=%s:%d", conn->info.get_ip(), conn->info.get_port());
+            swoole_warning("bad frame[opcode=0]. remote_addr=%s:%d", conn->info.get_addr(), conn->info.get_port());
             return SW_ERR;
         }
         offset = length - ws.payload_length;
@@ -260,71 +327,76 @@ int swWebSocket_dispatch_frame(Protocol *proto, Socket *_socket, const char *dat
         port = serv->get_port_by_fd(conn->fd);
         // frame data overflow
         if (frame_buffer->length + frame_length > port->protocol.package_max_length) {
-            swWarn("websocket frame is too big, remote_addr=%s:%d", conn->info.get_ip(), conn->info.get_port());
+            swoole_warning(
+                "websocket frame is too big, remote_addr=%s:%d", conn->info.get_addr(), conn->info.get_port());
             return SW_ERR;
         }
         // merge incomplete data
         frame_buffer->append(data + offset, frame_length);
         // frame is finished, do dispatch
         if (ws.header.FIN) {
-            proto->ext_flags = conn->websocket_buffer->offset;
-            proto->ext_flags |= SW_WEBSOCKET_FLAG_FIN;
-            Server::dispatch_task(proto, _socket, frame_buffer->str, frame_buffer->length);
+            dispatch_data.info.ext_flags = conn->websocket_buffer->offset | FLAG_FIN;
+            dispatch_data.info.len = frame_buffer->length;
+            dispatch_data.data = frame_buffer->str;
+            Server::dispatch_task(proto, _socket, &dispatch_data);
             delete frame_buffer;
             conn->websocket_buffer = nullptr;
         }
         break;
 
-    case WEBSOCKET_OPCODE_TEXT:
-    case WEBSOCKET_OPCODE_BINARY: {
+    case OPCODE_TEXT:
+    case OPCODE_BINARY: {
         offset = length - ws.payload_length;
-        proto->ext_flags = swWebSocket_get_ext_flags(ws.header.OPCODE, swWebSocket_get_flags(&ws));
-
+        uint16_t ext_flags = get_ext_flags(ws.header.OPCODE, ws.get_flags());
         if (!ws.header.FIN) {
             if (conn->websocket_buffer) {
-                swWarn("merging incomplete frame, bad request. remote_addr=%s:%d",
-                       conn->info.get_ip(),
-                       conn->info.get_port());
+                swoole_warning("merging incomplete frame, bad request. remote_addr=%s:%d",
+                               conn->info.get_addr(),
+                               conn->info.get_port());
                 return SW_ERR;
             }
-            conn->websocket_buffer = new swoole::String(data + offset, length - offset);
-            conn->websocket_buffer->offset = proto->ext_flags;
+            conn->websocket_buffer = new String(data + offset, length - offset);
+            conn->websocket_buffer->offset = ext_flags;
         } else {
-            Server::dispatch_task(proto, _socket, data + offset, length - offset);
+            dispatch_data.info.ext_flags = ext_flags;
+            dispatch_data.info.len = length - offset;
+            dispatch_data.data = data + offset;
+            Server::dispatch_task(proto, _socket, &dispatch_data);
         }
         break;
     }
-    case WEBSOCKET_OPCODE_PING:
-    case WEBSOCKET_OPCODE_PONG:
-        if (length >= (sizeof(buf) - SW_WEBSOCKET_HEADER_LEN)) {
-            swWarn("%s frame application data is too big. remote_addr=%s:%d",
-                   ws.header.OPCODE == WEBSOCKET_OPCODE_PING ? "ping" : "pong",
-                   conn->info.get_ip(),
-                   conn->info.get_port());
+    case OPCODE_PING:
+    case OPCODE_PONG:
+        if (ws.payload_length > SW_WEBSOCKET_CONTROL_FRAME_PAYLOAD_MAX_LEN) {
+            swoole_warning("%s frame application data is too big. remote_addr=%s:%d",
+                           ws.header.OPCODE == OPCODE_PING ? "ping" : "pong",
+                           conn->info.get_addr(),
+                           conn->info.get_port());
             return SW_ERR;
-        } else if (length == SW_WEBSOCKET_HEADER_LEN) {
-            data = nullptr;
-            length = 0;
+        } else if (ws.payload_length == 0) {
+            dispatch_data.data = nullptr;
+            dispatch_data.info.len = 0;
         } else {
             offset = ws.header.MASK ? SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_MASK_LEN : SW_WEBSOCKET_HEADER_LEN;
-            data += offset;
-            length -= offset;
+            dispatch_data.info.len = length - offset;
+            dispatch_data.data = dispatch_data.info.len == 0 ? nullptr : data + offset;
         }
-        proto->ext_flags = swWebSocket_get_ext_flags(ws.header.OPCODE, swWebSocket_get_flags(&ws));
-        Server::dispatch_task(proto, _socket, data, length);
+        dispatch_data.info.ext_flags = get_ext_flags(ws.header.OPCODE, ws.get_flags());
+        Server::dispatch_task(proto, _socket, &dispatch_data);
         break;
 
-    case WEBSOCKET_OPCODE_CLOSE:
-        if ((length - SW_WEBSOCKET_HEADER_LEN) > SW_WEBSOCKET_CLOSE_REASON_MAX_LEN) {
+    case OPCODE_CLOSE:
+        if (ws.payload_length > SW_WEBSOCKET_CONTROL_FRAME_PAYLOAD_MAX_LEN) {
             return SW_ERR;
         }
 
-        if (conn->websocket_status != WEBSOCKET_STATUS_CLOSING) {
+        if (!conn->is_websocket_status(STATUS_CLOSING)) {
             // Dispatch the frame with the same format of message frame
             offset = length - ws.payload_length;
-            proto->ext_flags = swWebSocket_get_ext_flags(ws.header.OPCODE, swWebSocket_get_flags(&ws));
-
-            Server::dispatch_task(proto, _socket, data + offset, length - offset);
+            dispatch_data.info.ext_flags = get_ext_flags(ws.header.OPCODE, ws.get_flags());
+            dispatch_data.info.len = length - offset;
+            dispatch_data.data = data + offset;
+            Server::dispatch_task(proto, _socket, &dispatch_data);
 
             // Client attempt to close
             send_frame.str[0] = 0x88;  // FIN | OPCODE: WEBSOCKET_OPCODE_CLOSE
@@ -341,8 +413,11 @@ int swWebSocket_dispatch_frame(Protocol *proto, Socket *_socket, const char *dat
         return SW_ERR;
 
     default:
-        swWarn("unknown opcode [%d]", ws.header.OPCODE);
+        swoole_warning("unknown opcode [%d]", ws.header.OPCODE);
         break;
     }
     return SW_OK;
 }
+#endif  // _WIN32
+}  // namespace websocket
+}  // namespace swoole

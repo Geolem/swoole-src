@@ -10,127 +10,211 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_coroutine.h"
-
-#include <sys/stat.h>
 
 #include <iostream>
 #include <string>
-#include <list>
-#include <queue>
+#include <algorithm>
+#include <deque>
+#include <memory>
+#include <utility>
 
 namespace swoole {
 namespace coroutine {
 //-------------------------------------------------------------------------------
-class Channel {
+class ChannelBase {
   public:
-    enum opcode {
+    enum Opcode {
         PRODUCER = 1,
         CONSUMER = 2,
     };
 
-    struct TimeoutMessage {
-        Channel *chan;
-        enum opcode type;
-        Coroutine *co;
-        bool error;
-        TimerNode *timer;
+    enum ErrorCode {
+        ERROR_OK = 0,
+        ERROR_TIMEOUT = -1,
+        ERROR_CLOSED = -2,
+        ERROR_CANCELED = -3,
     };
 
-    void *pop(double timeout = -1);
-    bool push(void *data, double timeout = -1);
-    bool close();
+    struct TimeoutMessage {
+        TimeoutMessage(ChannelBase *channel, Opcode opcode, Coroutine *coroutine)
+            : chan(channel), co(coroutine), timer(nullptr), type(opcode), error(false) {}
+        TimeoutMessage(const TimeoutMessage &) = delete;
+        TimeoutMessage &operator=(const TimeoutMessage &) = delete;
+        ~TimeoutMessage();
 
-    Channel(size_t _capacity = 1) : capacity(_capacity) {}
+        ChannelBase *chan;
+        Coroutine *co;
+        TimerNode *timer;
+        Opcode type;
+        bool error;
+    };
 
-    ~Channel() {
-        if (!producer_queue.empty()) {
-            swoole_error_log(SW_LOG_WARNING,
-                             SW_ERROR_CO_HAS_BEEN_DISCARDED,
-                             "channel is destroyed, %zu producers will be discarded",
-                             producer_queue.size());
-        }
-        if (!consumer_queue.empty()) {
-            swoole_error_log(SW_LOG_WARNING,
-                             SW_ERROR_CO_HAS_BEEN_DISCARDED,
-                             "channel is destroyed, %zu consumers will be discarded",
-                             consumer_queue.size());
-        }
-    }
+    explicit ChannelBase(size_t _capacity = 1) : capacity(_capacity == 0 ? 1 : _capacity) {}
 
-    inline bool is_closed() {
+    ~ChannelBase();
+
+    bool is_closed() const {
         return closed;
     }
 
-    inline bool is_empty() {
-        return data_queue.size() == 0;
-    }
+    bool close();
 
-    inline bool is_full() {
-        return data_queue.size() == capacity;
-    }
+    bool wait_push(bool full, double timeout = -1);
+    bool wait_pop(bool empty, double timeout = -1);
 
-    inline size_t length() {
-        return data_queue.size();
-    }
-
-    inline size_t consumer_num() {
+    size_t consumer_num() const {
         return consumer_queue.size();
     }
 
-    inline size_t producer_num() {
+    size_t producer_num() const {
         return producer_queue.size();
     }
 
-    inline void *pop_data() {
-        if (data_queue.size() == 0) {
-            return nullptr;
-        }
-        void *data = data_queue.front();
-        data_queue.pop();
-        return data;
+    int get_error() const {
+        return error_;
     }
 
   protected:
+    void notify_consumer();
+    void notify_producer();
+
     size_t capacity = 1;
     bool closed = false;
-    std::list<Coroutine *> producer_queue;
-    std::list<Coroutine *> consumer_queue;
-    std::queue<void *> data_queue;
+    int error_ = 0;
+    std::deque<Coroutine *> producer_queue;
+    std::deque<Coroutine *> consumer_queue;
 
     static void timer_callback(Timer *timer, TimerNode *tnode);
+    static void log_discarded(const char *type, size_t count);
 
-    void yield(enum opcode type);
+    void yield(Opcode type);
 
-    inline void consumer_remove(Coroutine *co) {
-        consumer_queue.remove(co);
+    void consumer_remove(Coroutine *co) {
+        consumer_queue.erase(std::remove(consumer_queue.begin(), consumer_queue.end(), co), consumer_queue.end());
     }
 
-    inline void producer_remove(Coroutine *co) {
-        producer_queue.remove(co);
+    void producer_remove(Coroutine *co) {
+        producer_queue.erase(std::remove(producer_queue.begin(), producer_queue.end(), co), producer_queue.end());
     }
 
-    inline Coroutine *pop_coroutine(enum opcode type) {
+    Coroutine *pop_coroutine(Opcode type) {
         Coroutine *co;
         if (type == PRODUCER) {
             co = producer_queue.front();
             producer_queue.pop_front();
-            swTraceLog(SW_TRACE_CHANNEL, "resume producer cid=%ld", co->get_cid());
+            swoole_trace_log(SW_TRACE_CHANNEL, "resume producer cid=%ld", co->get_cid());
         } else  // if (type == CONSUMER)
         {
             co = consumer_queue.front();
             consumer_queue.pop_front();
-            swTraceLog(SW_TRACE_CHANNEL, "resume consumer cid=%ld", co->get_cid());
+            swoole_trace_log(SW_TRACE_CHANNEL, "resume consumer cid=%ld", co->get_cid());
         }
         return co;
+    }
+};
+
+template <typename T>
+class ChannelImpl : public ChannelBase {
+  public:
+    explicit ChannelImpl(size_t _capacity = 1) : ChannelBase(_capacity), data_queue(new T[capacity]) {
+        if ((capacity & (capacity - 1)) == 0) {
+            mask_ = capacity - 1;
+        }
+    }
+
+    bool pop(T *data, double timeout = -1) {
+        if (sw_unlikely(!wait_pop(is_empty(), timeout))) {
+            return false;
+        }
+        if (sw_unlikely(closed && is_empty())) {
+            error_ = ERROR_CLOSED;
+            return false;
+        }
+        if (sw_unlikely(!pop_data(data))) {
+            return false;
+        }
+        notify_producer();
+        return true;
+    }
+
+    bool push(T data, double timeout = -1) {
+        if (sw_unlikely(!ChannelBase::wait_push(is_full(), timeout))) {
+            return false;
+        }
+        return push_data(std::move(data));
+    }
+
+    bool wait_push(double timeout = -1) {
+        return ChannelBase::wait_push(is_full(), timeout);
+    }
+
+    bool push_data(T data) {
+        if (sw_unlikely(is_full())) {
+            error_ = ERROR_TIMEOUT;
+            return false;
+        }
+        data_queue[tail_] = std::move(data);
+        tail_ = next(tail_);
+        count_++;
+        swoole_trace_log(SW_TRACE_CHANNEL, "push data to channel, count=%ld", length());
+        notify_consumer();
+        return true;
+    }
+
+    bool is_empty() const {
+        return count_ == 0;
+    }
+
+    bool is_full() const {
+        return count_ == capacity;
+    }
+
+    size_t length() const {
+        return count_;
+    }
+
+    bool pop_data(T *data) {
+        if (sw_unlikely(count_ == 0)) {
+            return false;
+        }
+        *data = std::move(data_queue[head_]);
+        head_ = next(head_);
+        count_--;
+        return true;
+    }
+
+  protected:
+    size_t next(size_t offset) const {
+        return mask_ ? (offset + 1) & mask_ : (++offset == capacity ? 0 : offset);
+    }
+
+    std::unique_ptr<T[]> data_queue;
+    size_t head_ = 0;
+    size_t tail_ = 0;
+    size_t count_ = 0;
+    size_t mask_ = 0;
+};
+
+class Channel : public ChannelImpl<void *> {
+  public:
+    using ChannelImpl<void *>::ChannelImpl;
+
+    void *pop(double timeout = -1) {
+        void *data = nullptr;
+        return ChannelImpl<void *>::pop(&data, timeout) ? data : nullptr;
+    }
+
+    void *pop_data() {
+        void *data = nullptr;
+        return ChannelImpl<void *>::pop_data(&data) ? data : nullptr;
     }
 };
 //-------------------------------------------------------------------------------

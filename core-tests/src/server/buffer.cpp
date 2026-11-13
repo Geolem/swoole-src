@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -26,14 +26,14 @@ using namespace swoole;
 static const char *packet = "hello world\n";
 
 TEST(server, send_buffer) {
-    swServer serv(swoole::Server::MODE_BASE);
+    Server serv(Server::MODE_BASE);
     serv.worker_num = 1;
 
     sw_logger()->set_level(SW_LOG_WARNING);
 
-    swListenPort *port = serv.add_port(SW_SOCK_TCP, TEST_HOST, 0);
+    ListenPort *port = serv.add_port(SW_SOCK_TCP, TEST_HOST, 0);
     if (!port) {
-        swWarn("listen failed, [error=%d]", swoole_get_last_error());
+        swoole_warning("listen failed, [error=%d]", swoole_get_last_error());
         exit(2);
     }
 
@@ -43,7 +43,7 @@ TEST(server, send_buffer) {
     lock.lock();
 
     std::thread t1([&]() {
-        swSignal_none();
+        swoole_signal_block_all();
 
         lock.lock();
 
@@ -65,12 +65,12 @@ TEST(server, send_buffer) {
         kill(getpid(), SIGTERM);
     });
 
-    serv.onWorkerStart = [&lock](swServer *serv, int worker_id) { lock.unlock(); };
+    serv.onWorkerStart = [&lock](Server *serv, Worker *worker) { lock.unlock(); };
 
-    serv.onReceive = [](swServer *serv, swRecvData *req) -> int {
+    serv.onReceive = [](Server *serv, RecvData *req) -> int {
         EXPECT_EQ(string(req->data, req->info.len), string(packet));
 
-        swString resp(1024 * 1024 * 16);
+        String resp(1024 * 1024 * 16);
         resp.repeat("A", 1, resp.capacity());
         EXPECT_TRUE(serv->send(req->info.fd, resp.value(), resp.get_length()));
         EXPECT_TRUE(serv->close(req->info.fd, 0));

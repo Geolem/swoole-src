@@ -10,29 +10,24 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #include "swoole_pipe.h"
 #include "swoole_socket.h"
 
-#include <memory>
-
 namespace swoole {
-UnixSocket::UnixSocket(bool blocking, int _protocol) :
-        SocketPair(blocking), protocol_(_protocol) {
+UnixSocket::UnixSocket(bool blocking, int _protocol) : SocketPair(blocking), protocol_(_protocol) {
     if (socketpair(AF_UNIX, protocol_, 0, socks) < 0) {
-        swSysWarn("socketpair() failed");
+        swoole_sys_warning("socketpair() failed");
         return;
     }
-    if (!init_socket(socks[1], socks[0])) {
-        return;
-    }
+    init_socket(socks[1], socks[0]);
     set_buffer_size(network::Socket::default_buffer_size);
 }
 
-bool UnixSocket::set_buffer_size(size_t _size) {
+bool UnixSocket::set_buffer_size(size_t _size) const {
     if (!master_socket->set_buffer_size(_size)) {
         return false;
     }
@@ -41,4 +36,4 @@ bool UnixSocket::set_buffer_size(size_t _size) {
     }
     return true;
 }
-}
+}  // namespace swoole

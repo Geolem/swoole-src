@@ -12,14 +12,22 @@ $pm->parentFunc = function () use ($pm) {
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, "http://127.0.0.1:{$pm->getFreePort()}/");
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch, CURLOPT_HEADER, TRUE);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'X-Test-Header1: value1',
+        'X-Test-Header2: value2',
+        'X-Test-Header2: value3',
+        'X-Test-Header3: value4',
+        'X-Test-Header3: value5',
+        'X-Test-Header3: value6',
+    ]);
+    curl_setopt($ch, CURLOPT_HEADER, true);
     echo curl_exec($ch);
     curl_close($ch);
     $pm->kill();
 };
 
 $pm->childFunc = function () use ($pm) {
-    $http = new swoole_http_server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
+    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
     $http->set([
         'worker_num' => 1,
         'enable_coroutine' => false,
@@ -28,8 +36,11 @@ $pm->childFunc = function () use ($pm) {
     $http->on('workerStart', function () use ($pm) {
         $pm->wakeup();
     });
-    $http->on('request', function (swoole_http_request $request, swoole_http_response $response) {
+    $http->on('request', function (Swoole\Http\Request $request, Swoole\Http\Response $response) {
         $msg = "hello world";
+        Assert::eq($request->header['x-test-header1'], 'value1');
+        Assert::eq($request->header['x-test-header2'], ['value2', 'value3']);
+        Assert::eq($request->header['x-test-header3'], ['value4', 'value5', 'value6']);
         $response->header("content-length", strlen($msg) . " ");
         $response->header("Test-Value", [
             "a\r\n",
@@ -58,8 +69,8 @@ Test-Value: e
 Test-Value: 5678
 Test-Value: 3.1415926
 Server: swoole-http-server
+Date: %s
 Connection: keep-alive
 Content-Type: text/html
-Date: %s
 
 hello world

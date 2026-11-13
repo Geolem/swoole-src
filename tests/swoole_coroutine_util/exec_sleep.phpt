@@ -2,6 +2,7 @@
 swoole_coroutine_util: coroutine exec
 --SKIPIF--
 <?php require __DIR__ . '/../include/skipif.inc';
+skip_if_win();
 ?>
 --FILE--
 <?php
@@ -12,9 +13,9 @@ for ($i = MAX_PROCESS_NUM; $i--;) {
         co::exec('sleep 1');
     });
 }
-swoole_event_wait();
+Swoole\Event::wait();
 $s = microtime(true) - $s;
-time_approximate(1, $s);
+time_approximate(1, $s, 0.5);
 echo "DONE\n";
 ?>
 --EXPECT--

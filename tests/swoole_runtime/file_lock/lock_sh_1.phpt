@@ -2,7 +2,6 @@
 swoole_runtime/file_lock: lock_sh_1
 --SKIPIF--
 <?php require __DIR__ . '/../../include/skipif.inc';
-die("skip not support");
 ?>
 --FILE--
 <?php
@@ -36,7 +35,7 @@ go(function () use ($startTime) {
     $ret = flock($f, LOCK_UN);
     Assert::assert($ret);
 });
-swoole_event_wait();
+Swoole\Event::wait();
 unlink(FILE);
 ?>
 --EXPECTF--

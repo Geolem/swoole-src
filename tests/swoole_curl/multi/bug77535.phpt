@@ -1,6 +1,7 @@
 --TEST--
-Bug #77535 (Invalid callback, h2 server push)
+swoole_curl/multi: Bug #77535 (Invalid callback, h2 server push)
 --SKIPIF--
+<?php require __DIR__ . '/../../include/skipif.inc'; ?>
 <?php
 if (getenv("SKIP_ONLINE_TESTS")) {
     die("skip online test");
@@ -12,6 +13,7 @@ if ($curl_version['version_number'] < 0x073d00) {
 ?>
 --FILE--
 <?php
+require __DIR__ . '/../../include/bootstrap.php';
 class MyHttpClient
 {
     private $mh;
@@ -33,7 +35,7 @@ class MyHttpClient
         curl_setopt($this->curl, CURLOPT_HEADER, false);
         curl_setopt($this->curl, CURLOPT_RETURNTRANSFER, false);
         curl_setopt($this->curl, CURLOPT_FAILONERROR, false);
-        curl_setopt($this->curl, CURLOPT_URL, 'https://http2.golang.org/serverpush');
+        curl_setopt($this->curl, CURLOPT_URL, TEST_HTTP2_SERVERPUSH_URL);
         curl_setopt($this->curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
         curl_setopt($this->curl, CURLOPT_HEADERFUNCTION, function ($ch, $data) {
             return \strlen($data);
@@ -90,5 +92,3 @@ MyHttpClient::addServerPushCallback
 MyHttpClient::sendRequest[2]
 MyHttpClient::sendRequest[3]
 Start handle request.
-
-

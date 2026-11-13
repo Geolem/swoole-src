@@ -10,13 +10,12 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole_api.h"
 #include "swoole_ssl.h"
 
 #ifdef SW_SUPPORT_DTLS
@@ -32,8 +31,9 @@ int BIO_read(BIO *b, char *data, int dlen);
 long BIO_ctrl(BIO *b, int cmd, long larg, void *pargs);
 int BIO_create(BIO *b);
 int BIO_destroy(BIO *b);
-BIO_METHOD *BIO_get_methods(void);
-void BIO_meth_free(void);
+bool BIO_methods_init();
+BIO_METHOD *BIO_get_methods();
+void BIO_meth_free();
 
 struct Buffer {
     uint16_t length;
@@ -41,13 +41,13 @@ struct Buffer {
 };
 
 struct Session {
-    SSLContext *ctx;
+    std::shared_ptr<SSLContext> ctx;
     bool listened = false;
     Socket *socket;
     std::deque<Buffer *> rxqueue;
     bool peek_mode = false;
 
-    Session(Socket *_sock, SSLContext *_ctx) {
+    Session(Socket *_sock, const std::shared_ptr<SSLContext> &_ctx) {
         socket = _sock;
         ctx = _ctx;
     }
@@ -65,13 +65,13 @@ struct Session {
 
     void append(const char *data, ssize_t len);
 
-    inline void append(Buffer *buffer) {
+    void append(Buffer *buffer) {
         rxqueue.push_back(buffer);
     }
 
-    inline size_t get_buffer_length() {
+    size_t get_buffer_length() const {
         size_t total_length = 0;
-        for (auto i : rxqueue) {
+        for (const auto i : rxqueue) {
             total_length += i->length;
         }
         return total_length;

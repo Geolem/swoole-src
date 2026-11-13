@@ -10,64 +10,73 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #include "swoole_pipe.h"
 #include "swoole_socket.h"
 
-#include <memory>
-
 namespace swoole {
 using network::Socket;
 
-bool SocketPair::init_socket(int master_fd, int worker_fd) {
+void SocketPair::init_socket(swSocketFd master_fd, swSocketFd worker_fd) {
     master_socket = make_socket(master_fd, SW_FD_PIPE);
-    if (master_socket == nullptr) {
-    _error:
-        ::close(master_fd);
-        ::close(worker_fd);
-        return false;
-    }
     worker_socket = make_socket(worker_fd, SW_FD_PIPE);
-    if (worker_socket == nullptr) {
-        master_socket->free();
-        ::close(worker_fd);
-        goto _error;
-    }
     set_blocking(blocking);
-    return true;
 }
 
 Pipe::Pipe(bool _blocking) : SocketPair(_blocking) {
+#ifdef _WIN32
+    if (sw_socketpair(AF_INET, SOCK_STREAM, 0, socks) < 0) {
+        swoole_sys_warning("socketpair() failed");
+        return;
+    }
+#else
     if (pipe(socks) < 0) {
-        swSysWarn("pipe() failed");
+        swoole_sys_warning("pipe() failed");
         return;
     }
-    if (!init_socket(socks[1], socks[0])) {
-        return;
+#endif
+    // socks[0]: (read end)
+    // socks[1]: (write end)
+    init_socket(socks[1], socks[0]);
+}
+
+void SocketPair::set_blocking(bool _blocking) {
+    if (_blocking) {
+        worker_socket->set_block();
+        master_socket->set_block();
+    } else {
+        worker_socket->set_nonblock();
+        master_socket->set_nonblock();
+    }
+    blocking = _blocking;
+}
+
+ssize_t SocketPair::read(void *data, size_t length) const {
+    if (blocking) {
+        return worker_socket->read_sync(data, length);
+    } else {
+        return worker_socket->read(data, length);
     }
 }
 
-ssize_t SocketPair::read(void *data, size_t length) {
-    if (blocking && timeout > 0) {
-        if (worker_socket->wait_event(timeout * 1000, SW_EVENT_READ) < 0) {
-            return SW_ERR;
-        }
+ssize_t SocketPair::write(const void *data, size_t length) const {
+    if (blocking) {
+        return master_socket->write_sync(data, length);
+    } else {
+        return master_socket->write(data, length);
     }
-    return worker_socket->read(data, length);
 }
 
-ssize_t SocketPair::write(const void *data, size_t length) {
-    ssize_t n = master_socket->write(data, length);
-    if (blocking && n < 0 && timeout > 0 && master_socket->catch_error(errno) == SW_WAIT) {
-        if (master_socket->wait_event(timeout * 1000, SW_EVENT_READ) < 0) {
-            return SW_ERR;
+void SocketPair::clean() const {
+    char buf[1024];
+    while (worker_socket->wait_event(0, SW_EVENT_READ) == SW_OK) {
+        if (worker_socket->read(buf, sizeof(buf)) <= 0) {
+            break;
         }
-        n = master_socket->write(data, length);
     }
-    return n;
 }
 
 bool SocketPair::close(int which) {
@@ -91,12 +100,12 @@ bool SocketPair::close(int which) {
 }
 
 SocketPair::~SocketPair() {
-    if (!master_socket) {
+    if (master_socket) {
         close(SW_PIPE_CLOSE_MASTER);
     }
-    if (!worker_socket) {
+    if (worker_socket) {
         close(SW_PIPE_CLOSE_WORKER);
     }
 }
 
-}
+}  // namespace swoole

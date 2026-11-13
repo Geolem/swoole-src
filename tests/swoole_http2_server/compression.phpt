@@ -12,8 +12,8 @@ $pm->parentFunc = function ($pid) use ($pm) {
         $cli = new Swoole\Coroutine\Http2\Client($domain, $pm->getFreePort(), true);
         $cli->set([
             'timeout' => -1,
-            'ssl_cert_file' => SSL_FILE_DIR2 . '/client-cert.pem',
-            'ssl_key_file' => SSL_FILE_DIR2 . '/client-key.pem'
+            'ssl_cert_file' => SSL_FILE_DIR . '/client-cert.pem',
+            'ssl_key_file' => SSL_FILE_DIR . '/client-key.pem'
         ]);
         $cli->connect();
 
@@ -33,10 +33,10 @@ $pm->parentFunc = function ($pid) use ($pm) {
         }
         $pm->kill();
     });
-    swoole_event::wait();
+    Swoole\Event::wait();
 };
 $pm->childFunc = function () use ($pm) {
-    $http = new swoole_http_server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE, SWOOLE_SOCK_TCP | SWOOLE_SSL);
+    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE, SWOOLE_SOCK_TCP | SWOOLE_SSL);
     $http->set([
             'log_file' => '/dev/null',
             'open_http2_protocol' => true,
@@ -44,17 +44,17 @@ $pm->childFunc = function () use ($pm) {
             'http_compression' => true,
             'ssl_cert_file' => SSL_FILE_DIR . '/server.crt',
             'ssl_key_file' => SSL_FILE_DIR . '/server.key'
-        ] + (IS_IN_TRAVIS ? [] : [
+        ] + (IS_IN_CI ? [] : [
             'ssl_verify_peer' => true,
             'ssl_allow_self_signed' => true,
-            'ssl_client_cert_file' => SSL_FILE_DIR2 . '/ca-cert.pem'
+            'ssl_client_cert_file' => SSL_FILE_DIR . '/ca-cert.pem'
         ])
     );
     $http->on("WorkerStart", function ($serv, $wid) {
         global $pm;
         $pm->wakeup();
     });
-    $http->on("request", function ($request, swoole_http_response $response) {
+    $http->on("request", function ($request, Swoole\Http\Response $response) {
         $response->end(co::readFile(__DIR__ . '/../../README.md'));
     });
     $http->start();

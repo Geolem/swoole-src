@@ -1,18 +1,25 @@
 --TEST--
 swoole_server/event: onWorkerExit
 --SKIPIF--
-<?php require __DIR__ . '/../../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../../include/skipif.inc';
+// master/manager/worker are only synchronized by a barrier before the workers are
+// forked, the order in which onStart/onManagerStart/onWorkerStart write the log
+// is not guaranteed and differs on the slower macOS runners
+skip_if_darwin_todo('log write order between master, manager and worker is racy');
+?>
 --FILE--
 <?php
 require __DIR__ . '/../../include/bootstrap.php';
 
+use Swoole\Atomic;
 use Swoole\Constant;
 use Swoole\Process;
 use Swoole\Server;
-use Swoole\Atomic;
 use Swoole\Timer;
+use SwooleTest\ProcessManager;
 
-$pm = new SwooleTest\ProcessManager;
+$pm = new ProcessManager();
 $pm->setWaitTimeout(5);
 
 const FILE = __DIR__ . '/tmp_result.txt';
@@ -29,31 +36,36 @@ $pm->parentFunc = function () use ($pm) {
 };
 
 $pm->childFunc = function () use ($pm, $atomic) {
-    $serv = new Server('127.0.0.1', $pm->getFreePort());
+    $serv = new Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
 
     $serv->set([
-        "worker_num" => 1,
+        'worker_num' => 1,
         'log_file' => '/dev/null',
     ]);
 
-    $serv->on("start", function (Server $serv) use ($atomic, $pm) {
+    $serv->on('start', function (Server $serv) use ($atomic, $pm) {
         $pm->writeLog('master start');
     });
 
     $serv->on(Constant::EVENT_MANAGER_START, function (Server $serv) use ($atomic, $pm) {
+        usleep(10000);
         $pm->writeLog('manager start');
     });
 
     $serv->on(Constant::EVENT_WORKER_START, function (Server $serv) use ($atomic, $pm) {
+        if ($atomic->get() == 0) {
+            usleep(20000);
+        }
         $pm->writeLog('worker start, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus());
 
         if ($atomic->add() == 2) {
             usleep(10000);
             $serv->shutdown();
         } else {
-            $serv->timer = Timer::tick(100, function () use ($serv, $pm) {
+            $GLOBALS['timer'] = Timer::tick(100, function () use ($serv, $pm) {
                 $pm->writeLog(
-                    'tick, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus());
+                    'tick, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus()
+                );
                 $pm->wakeup();
             });
         }
@@ -61,15 +73,16 @@ $pm->childFunc = function () use ($pm, $atomic) {
 
     $serv->on(Constant::EVENT_WORKER_EXIT, function (Server $serv) use ($atomic, $pm) {
         $pm->writeLog(
-            'worker exit, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus());
-        Timer::clear($serv->timer);
+            'worker exit, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus()
+        );
+        Timer::clear($GLOBALS['timer']);
     });
 
     $serv->on(Constant::EVENT_WORKER_STOP, function (Server $serv) use ($pm) {
         $pm->writeLog('worker stop');
     });
 
-    $serv->on("Receive", function () { });
+    $serv->on('Receive', function () {});
 
     $serv->start();
 };

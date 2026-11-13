@@ -1,7 +1,88 @@
 #include "test_core.h"
 #include "swoole_util.h"
 
+#include <stdexcept>
+
 using namespace std;
+using swoole::String;
+
+TEST(string, invalid_write_preserves_storage_and_content) {
+    String str("kept");
+    const auto storage = str.str;
+    const auto capacity = str.capacity();
+    EXPECT_THROW(str.write(-1, "x", 1), std::out_of_range);
+    EXPECT_THROW(str.write(1, "x", SIZE_MAX), std::length_error);
+    EXPECT_EQ(str.str, storage);
+    EXPECT_EQ(str.capacity(), capacity);
+    EXPECT_EQ(str.to_std_string(), "kept");
+    str.write(4, "!", 1);
+    EXPECT_EQ(str.to_std_string(), "kept!");
+}
+
+TEST(string, length_overflow_is_rejected_before_accessing_input) {
+    String str("kept");
+    EXPECT_THROW(str.append("x", SIZE_MAX), std::length_error);
+    EXPECT_THROW(str.grow(SIZE_MAX), std::length_error);
+    EXPECT_THROW(str.append_random_bytes(SIZE_MAX), std::length_error);
+    EXPECT_THROW(str.append_random_bytes(SIZE_MAX - 4, true), std::length_error);
+    EXPECT_THROW(String("x", SIZE_MAX), std::length_error);
+    EXPECT_EQ(str.to_std_string(), "kept");
+    EXPECT_TRUE(str.substr(SIZE_MAX, 1).empty());
+    EXPECT_TRUE(str.substr(1, SIZE_MAX).empty());
+    EXPECT_EQ(str.substr(1, 3).to_std_string(), "ept");
+}
+
+TEST(string, grow_allocation_failure_preserves_length) {
+    auto allocator = *sw_std_allocator();
+    String str(16, &allocator);
+    str.append("kept", 4);
+    const auto storage = str.str;
+    const auto capacity = str.capacity();
+    allocator.realloc = [](void *, size_t) -> void * { return nullptr; };
+    EXPECT_THROW(str.grow(capacity), std::bad_alloc);
+    EXPECT_EQ(str.str, storage);
+    EXPECT_EQ(str.capacity(), capacity);
+    EXPECT_EQ(str.to_std_string(), "kept");
+}
+
+TEST(string, empty_growth_and_self_append) {
+    String empty;
+    empty.extend_align(32);
+    EXPECT_GE(empty.capacity(), 32);
+    EXPECT_EQ(empty.length, 0);
+    String grown;
+    grown.grow(32);
+    EXPECT_EQ(grown.length, 32);
+    EXPECT_GE(grown.capacity(), grown.length);
+    String str("self");
+    str.append(str);
+    EXPECT_EQ(str.to_std_string(), "selfself");
+}
+
+TEST(string, ltrim) {
+    char buf[1024];
+    char *ptr_buf;
+    strcpy(buf, "  hello world");
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("hello world", ptr_buf), 0);
+    ASSERT_NE(strcmp("  hello world", ptr_buf), 0);
+
+    strcpy(buf, "  ");
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strlen(ptr_buf), 0);
+
+    memcpy(buf, "  a\0b\0", 6);
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("a", ptr_buf), 0);
+
+    buf[0] = '\0';
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("", ptr_buf), 0);
+}
 
 TEST(string, rtrim) {
     char buf[1024];
@@ -13,6 +94,108 @@ TEST(string, rtrim) {
     strcpy(buf, "  ");
     swoole::rtrim(buf, strlen(buf));
     ASSERT_EQ(strlen(buf), 0);
+
+    buf[0] = '\0';
+    swoole::rtrim(buf, strlen(buf));
+    ASSERT_EQ(strcmp("", buf), 0);
+}
+
+TEST(string, move_and_copy) {
+    String s1(TEST_STR);
+    ASSERT_MEMEQ(s1.str, TEST_STR, s1.length);
+
+    String s2(s1);
+    ASSERT_MEMEQ(s2.str, TEST_STR, s2.length);
+    ASSERT_NE(s1.str, nullptr);
+
+    String s3(std::move(s1));
+    ASSERT_MEMEQ(s3.str, TEST_STR, s3.length);
+    ASSERT_EQ(s1.str, nullptr);
+
+    String s4;
+    s4 = s3;
+    ASSERT_MEMEQ(s4.str, TEST_STR, s4.length);
+    ASSERT_NE(s3.str, nullptr);
+
+    String s5;
+    s5 = std::move(s3);
+    ASSERT_MEMEQ(s5.str, TEST_STR, s5.length);
+    ASSERT_EQ(s3.str, nullptr);
+
+    String s6(SW_STRL(TEST_STR));
+    ASSERT_MEMEQ(s6.str, TEST_STR, s6.length);
+}
+
+TEST(string, append) {
+    String s1(TEST_STR);
+    s1.append(12345678);
+
+    String s2(TEST_STR2);
+    s1.append(s2);
+
+    ASSERT_MEMEQ(s1.str, TEST_STR "12345678" TEST_STR2, s1.length);
+}
+
+TEST(string, write) {
+    String s1;
+    s1.reserve(32);
+
+    String s2(TEST_STR);
+    s1.repeat(" ", 1, 30);
+    s1.write(30, s2);
+
+    auto s3 = s1.substr(30, s2.length);
+    ASSERT_MEMEQ(s3.str, TEST_STR, s3.length);
+}
+
+TEST(string, grow_should_reserve_when_crossing_capacity) {
+    String s1(8);
+    s1.append("hello", 5);
+    s1.grow(4);
+
+    ASSERT_GE(s1.capacity(), s1.get_length());
+}
+
+TEST(string, repeat) {
+    auto end_str = "[end]";
+    String s1;
+    s1.repeat(SW_STRL("hello\r\n"), 5);
+    s1.append(end_str);
+
+    int count = 0;
+    auto offset = s1.split(SW_STRL("\r\n"), [&](const char *data, size_t length) -> bool {
+        count++;
+        EXPECT_MEMEQ(data, "hello\r\n", 7);
+        return true;
+    });
+
+    ASSERT_EQ(offset, s1.length - strlen(end_str));
+    ASSERT_MEMEQ(s1.str + offset, end_str, strlen(end_str));
+
+    ASSERT_EQ(count, 5);
+}
+
+TEST(string, release) {
+    String s1(TEST_STR);
+    ASSERT_MEMEQ(s1.str, TEST_STR, s1.length);
+
+    auto s2 = s1.release();
+    ASSERT_EQ(s1.str, nullptr);
+    ASSERT_EQ(s1.length, 0);
+
+    ASSERT_MEMEQ(s2, TEST_STR, strlen(TEST_STR));
+    sw_free(s2);
+}
+
+TEST(string, ub) {
+    String s1(TEST_STR);
+    String s2(TEST_STR2);
+
+    s1 = s2;
+    s1 = s1;
+
+    auto rs = s1.substr(s1.length, 10);
+    ASSERT_EQ(rs.str, nullptr);
 }
 
 TEST(string, strnpos) {
@@ -38,17 +221,19 @@ TEST(string, strnstr) {
     {
         string haystack = "hello world";
         string needle = " ";
-        const char *pos;
-
-        pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
         ASSERT_EQ(haystack.c_str() + 5, pos);
     }
     {
         string haystack = "hello world";
         string needle = "*";
-        const char *pos;
-
-        pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        ASSERT_EQ(NULL, pos);
+    }
+    {
+        string haystack = "hello world\r\n";
+        string needle = "\r\n\r\n";
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
         ASSERT_EQ(NULL, pos);
     }
 }
@@ -57,7 +242,7 @@ TEST(string, explode) {
     string haystack = "hello world";
     string needle = " ";
 
-    swString str;
+    String str;
     str.str = (char *) haystack.c_str();
     str.length = haystack.length();
 
@@ -82,7 +267,7 @@ TEST(string, explode_2) {
     string haystack = "hello,world,swoole,php,last";
     string needle = ",";
 
-    swString str;
+    String str;
     str.str = (char *) haystack.c_str();
     str.length = haystack.length();
 
@@ -109,7 +294,7 @@ static string test_data = "hello,world,swoole,php,last";
 
 TEST(string, pop_1) {
     auto str = swoole::make_string(init_size);
-    std::unique_ptr<swString> s(str);
+    std::unique_ptr<String> s(str);
 
     char *str_1 = str->str;
 
@@ -128,7 +313,7 @@ TEST(string, pop_1) {
 
 TEST(string, pop_2) {
     auto str = swoole::make_string(init_size);
-    std::unique_ptr<swString> s(str);
+    std::unique_ptr<String> s(str);
 
     char *str_1 = str->str;
 
@@ -147,7 +332,7 @@ TEST(string, pop_2) {
 
 TEST(string, reduce_1) {
     auto str = swoole::make_string(init_size);
-    std::unique_ptr<swString> s(str);
+    std::unique_ptr<String> s(str);
 
     const int len_1 = 11;
     str->append(test_data.c_str(), test_data.length());
@@ -160,7 +345,7 @@ TEST(string, reduce_1) {
 
 TEST(string, reduce_2) {
     auto str = swoole::make_string(init_size);
-    std::unique_ptr<swString> s(str);
+    std::unique_ptr<String> s(str);
 
     str->append(test_data.c_str(), test_data.length());
     str->offset = str->length;
@@ -172,7 +357,7 @@ TEST(string, reduce_2) {
 
 TEST(string, reduce_3) {
     auto str = swoole::make_string(init_size);
-    std::unique_ptr<swString> s(str);
+    std::unique_ptr<String> s(str);
 
     str->append(test_data.c_str(), test_data.length());
     str->offset = 0;
@@ -182,22 +367,335 @@ TEST(string, reduce_3) {
     EXPECT_EQ(str->length, test_data.length());
 }
 
-TEST(string, format) {
-    swString str(128);
+const auto FORMAT_INT = 999999999999999;
+const auto FORMAT_STR = "hello world";
 
-    int a = swoole_rand(1000000, 9000000);
+TEST(string, format_1) {
+    String str1(1024);
+    str1.append_random_bytes(1024, true);
 
-    swString str2(1024);
-    str2.append_random_bytes(1024, true);
+    size_t n = str1.format("str=%s, value=%ld", FORMAT_STR, FORMAT_INT);
+    std::string str2("str=hello world, value=999999999999999");
 
-    str.format("a=%d, b=%.*s\r\n", a, str2.length, str2.str);
+    ASSERT_EQ(n, str2.size());
+    ASSERT_EQ(str1.to_std_string(), str2);
+}
 
-    EXPECT_GT(str.size, 1024);
-    EXPECT_STREQ(str.str + str.length - 2, "\r\n");
+TEST(string, format_2) {
+    String str1(1024);
+    str1.append_random_bytes(1024, true);
+
+    std::string str2(str1.value(), str1.get_length());
+    str2 += "str=hello world, value=999999999999999";
+
+    size_t n = str1.format_impl(String::FORMAT_APPEND, "str=%s, value=%ld", FORMAT_STR, FORMAT_INT);
+
+    EXPECT_EQ(n, strlen("str=hello world, value=999999999999999"));
+    EXPECT_EQ(str1.to_std_string(), str2);
 }
 
 TEST(string, substr_len) {
     const char *str1 = "hello: swoole & world";
     ASSERT_EQ(swoole::substr_len(str1, strlen(str1), ':', true), 5);
     ASSERT_EQ(swoole::substr_len(str1, strlen(str1), ':', false), 15);
+}
+
+TEST(string, starts_with) {
+    const char *str1 = "hello world";
+    ASSERT_TRUE(swoole::starts_with(str1, strlen(str1), SW_STRL("hello")));
+    ASSERT_FALSE(swoole::starts_with(str1, strlen(str1), SW_STRL("php")));
+    ASSERT_TRUE(swoole::starts_with(str1, strlen(str1), str1, strlen(str1)));
+}
+
+TEST(string, ends_with) {
+    const char *str1 = "hello world";
+    ASSERT_TRUE(swoole::ends_with(str1, strlen(str1), SW_STRL("world")));
+    ASSERT_FALSE(swoole::ends_with(str1, strlen(str1), SW_STRL("php")));
+    ASSERT_TRUE(swoole::ends_with(str1, strlen(str1), str1, strlen(str1)));
+}
+
+TEST(string, append_number) {
+    string data = "hello";
+    auto str = swoole::make_string(data.length() + 32);
+    str->append(data.c_str(), data.length());
+    str->append(123);
+    str->set_null_terminated();
+    EXPECT_STREQ(str->str, data.append("123").c_str());
+
+    str->print(true);
+    str->print(false);
+
+    delete str;
+}
+
+TEST(string, allocation_failure_throws_without_touching_existing_data) {
+    auto allocator = *sw_std_allocator();
+    allocator.malloc = [](size_t) -> void * { return nullptr; };
+    EXPECT_THROW(String(16, &allocator), std::bad_alloc);
+
+    String str("kept");
+    str.offset = 2;
+    str.allocator = &allocator;
+    const auto original = str.str;
+    const auto capacity = str.capacity();
+    EXPECT_EQ(str.pop(16), nullptr);
+    EXPECT_EQ(str.str, original);
+    EXPECT_EQ(str.to_std_string(), "kept");
+    EXPECT_EQ(str.offset, 2);
+    EXPECT_EQ(str.capacity(), capacity);
+
+    allocator.realloc = [](void *, size_t) -> void * { return nullptr; };
+    EXPECT_THROW(str.reserve(capacity * 2), std::bad_alloc);
+    EXPECT_EQ(str.str, original);
+    EXPECT_EQ(str.to_std_string(), "kept");
+    EXPECT_EQ(str.offset, 2);
+    EXPECT_EQ(str.capacity(), capacity);
+}
+
+TEST(string, move_assignment_releases_old_storage_and_preserves_offset) {
+    String source(std::string("a\0bc", 4));
+    source.offset = 2;
+    const auto storage = source.str;
+    const auto capacity = source.capacity();
+    String destination("old allocation");
+    destination = std::move(source);
+    EXPECT_EQ(destination.str, storage);
+    EXPECT_EQ(destination.to_std_string(), std::string("a\0bc", 4));
+    EXPECT_EQ(destination.offset, 2);
+    EXPECT_EQ(destination.capacity(), capacity);
+    EXPECT_EQ(source.str, nullptr);
+    EXPECT_EQ(source.length, 0u);
+    EXPECT_EQ(source.size, 0u);
+    EXPECT_EQ(source.offset, 0);
+    auto *alias = &destination;
+    destination = std::move(*alias);
+    EXPECT_EQ(destination.str, storage);
+    EXPECT_EQ(destination.offset, 2);
+    EXPECT_EQ(destination.to_std_string(), std::string("a\0bc", 4));
+    source.append("reused");
+    EXPECT_EQ(source.to_std_string(), "reused");
+}
+
+TEST(string, copy_owns_independent_binary_storage_and_offset) {
+    String source(std::string("a\0bc", 4));
+    source.offset = 1;
+    String copy(source);
+    ASSERT_NE(copy.str, source.str);
+    EXPECT_EQ(copy.to_std_string(), source.to_std_string());
+    EXPECT_EQ(copy.offset, 1);
+    source.write(0, "z", 1);
+    EXPECT_EQ(copy.to_std_string(), std::string("a\0bc", 4));
+    copy.clear();
+    EXPECT_EQ(copy.length, 0u);
+    EXPECT_EQ(copy.offset, 0);
+    EXPECT_FALSE(source.empty());
+    EXPECT_TRUE(copy.empty());
+}
+
+TEST(string, copy_assignment_preserves_destination_on_allocation_failure) {
+    ASSERT_EXIT(
+        {
+            static bool fail = false;
+            auto allocator = *sw_std_allocator();
+            allocator.malloc = [](size_t size) -> void * { return fail ? nullptr : sw_std_allocator()->malloc(size); };
+            String source(64, &allocator);
+            source.append("source");
+            String destination("kept");
+            destination.offset = 2;
+            const auto storage = destination.str;
+            const auto capacity = destination.capacity();
+            const auto original_allocator = destination.allocator;
+            fail = true;
+            try {
+                destination = source;
+            } catch (const std::bad_alloc &) {
+                const bool preserved = destination.str == storage && destination.capacity() == capacity &&
+                                       destination.offset == 2 && destination.allocator == original_allocator &&
+                                       destination.to_std_string() == "kept" && source.to_std_string() == "source";
+                _exit(preserved ? 0 : 2);
+            }
+            _exit(3);
+        },
+        ::testing::ExitedWithCode(0),
+        "");
+}
+
+TEST(string, copy_assignment_reuses_storage_with_the_same_allocator) {
+    static size_t allocations;
+    allocations = 0;
+    auto allocator = *sw_std_allocator();
+    allocator.malloc = [](size_t size) -> void * {
+        allocations++;
+        return sw_std_allocator()->malloc(size);
+    };
+    String source(16, &allocator);
+    source.append("a\0bc", 4);
+    source.offset = 1;
+    String destination(128, &allocator);
+    destination.append("old");
+    const auto storage = destination.str;
+    const auto capacity = destination.capacity();
+    allocations = 0;
+
+    destination = source;
+    EXPECT_EQ(allocations, 0);
+    EXPECT_EQ(destination.str, storage);
+    EXPECT_EQ(destination.capacity(), capacity);
+    EXPECT_EQ(destination.to_std_string(), std::string("a\0bc", 4));
+    EXPECT_EQ(destination.offset, 1);
+    source.write(0, "z", 1);
+    EXPECT_EQ(destination.to_std_string(), std::string("a\0bc", 4));
+    auto *alias = &destination;
+    destination = *alias;
+    EXPECT_EQ(allocations, 0);
+    EXPECT_EQ(destination.str, storage);
+}
+
+TEST(string, empty_copy_and_moved_from_storage_keep_allocator_policy) {
+    static size_t allocations;
+    allocations = 0;
+    auto allocator = *sw_std_allocator();
+    allocator.malloc = [](size_t size) -> void * {
+        allocations++;
+        return sw_std_allocator()->malloc(size);
+    };
+    String empty;
+    String empty_copy(empty);
+    EXPECT_EQ(empty_copy.str, nullptr);
+    EXPECT_EQ(empty_copy.capacity(), 0);
+
+    String source(16, &allocator);
+    source.append("moved");
+    String owner(std::move(source));
+    allocations = 0;
+    String moved_copy(source);
+    EXPECT_EQ(allocations, 0);
+    EXPECT_EQ(moved_copy.str, nullptr);
+    EXPECT_EQ(moved_copy.allocator, &allocator);
+    source.append("reused");
+    EXPECT_EQ(allocations, 1);
+    EXPECT_EQ(source.allocator, &allocator);
+    EXPECT_EQ(source.to_std_string(), "reused");
+    owner = empty;
+    EXPECT_EQ(owner.str, nullptr);
+    EXPECT_TRUE(owner.empty());
+}
+
+TEST(string, copy_of_borrowed_storage_owns_its_bytes) {
+    char bytes[] = {'a', '\0', 'b'};
+    String view;
+    view.str = bytes;
+    view.length = sizeof(bytes);
+    view.offset = 1;
+
+    String copy(view);
+    ASSERT_NE(copy.str, view.str);
+    EXPECT_GE(copy.capacity(), copy.length);
+    EXPECT_EQ(copy.offset, 1);
+    EXPECT_EQ(copy.to_std_string(), std::string("a\0b", 3));
+    bytes[0] = 'z';
+    EXPECT_EQ(copy.to_std_string(), std::string("a\0b", 3));
+
+    String destination(16);
+    destination = view;
+    EXPECT_EQ(destination.to_std_string(), std::string("z\0b", 3));
+    EXPECT_EQ(destination.offset, 1);
+}
+
+TEST(string, repeat_reserves_once_for_binary_patterns) {
+    static size_t reallocations;
+    reallocations = 0;
+    auto allocator = *sw_std_allocator();
+    allocator.realloc = [](void *ptr, size_t size) -> void * {
+        reallocations++;
+        return sw_std_allocator()->realloc(ptr, size);
+    };
+    String str(8, &allocator);
+    str.append("prefix:");
+    const std::string pattern("a\0b", 3);
+    std::string expected("prefix:");
+    for (int i = 0; i < 1000; i++) {
+        expected += pattern;
+    }
+    str.repeat(pattern.data(), pattern.size(), 1000);
+    EXPECT_EQ(str.to_std_string(), expected);
+    EXPECT_EQ(reallocations, 1);
+    str.repeat("unused", 0, 1000);
+    EXPECT_EQ(str.to_std_string(), expected);
+    EXPECT_EQ(reallocations, 1);
+}
+
+TEST(string, repeat_rejects_size_overflow_without_changing_content) {
+    String str("kept");
+    const auto storage = str.str;
+    EXPECT_THROW(str.repeat("ab", 2, SIZE_MAX), std::length_error);
+    EXPECT_THROW(str.repeat("a", 1, SIZE_MAX - str.length), std::length_error);
+    EXPECT_EQ(str.str, storage);
+    EXPECT_EQ(str.to_std_string(), "kept");
+}
+
+TEST(string, allocation_alignment_overflow_preserves_existing_storage) {
+    EXPECT_THROW(String(SIZE_MAX), std::length_error);
+    String str("kept");
+    str.offset = 1;
+    const auto storage = str.str;
+    const auto capacity = str.capacity();
+    EXPECT_THROW(str.reserve(SIZE_MAX), std::length_error);
+    EXPECT_THROW(str.pop(SIZE_MAX), std::length_error);
+    EXPECT_EQ(str.str, storage);
+    EXPECT_EQ(str.capacity(), capacity);
+    EXPECT_EQ(str.offset, 1);
+    EXPECT_EQ(str.to_std_string(), "kept");
+}
+
+TEST(string, null_termination_grows_full_buffer_without_changing_length) {
+    String str(8);
+    str.repeat("x", 1, str.capacity());
+    const auto original_length = str.length;
+    str.set_null_terminated();
+    EXPECT_GT(str.capacity(), original_length);
+    EXPECT_EQ(str.length, original_length);
+    EXPECT_EQ(str.str[str.length], '\0');
+    EXPECT_EQ(str.to_std_string(), std::string(original_length, 'x'));
+    const auto capacity = str.capacity();
+    str.set_null_terminated();
+    EXPECT_EQ(str.capacity(), capacity);
+}
+
+TEST(string, binary_comparisons_respect_explicit_lengths) {
+    String str(std::string("a\0bc", 4));
+    EXPECT_TRUE(str.contains(std::string("\0b", 2)));
+    EXPECT_FALSE(str.contains("bd"));
+    EXPECT_TRUE(str.starts_with(std::string("a\0", 2)));
+    EXPECT_TRUE(str.ends_with(std::string("\0bc", 3)));
+    EXPECT_TRUE(str.equals(std::string("a\0bc", 4)));
+    EXPECT_TRUE(str.equals("a\0bc", 4));
+    EXPECT_FALSE(str.equals("a", 1));
+    EXPECT_FALSE(str.equals(std::string("a\0bd", 4)));
+    EXPECT_FALSE(str.starts_with("a\0bcd", 5));
+    EXPECT_FALSE(str.ends_with("a\0bcd", 5));
+    EXPECT_FALSE(str.starts_with("z", 1));
+    EXPECT_FALSE(str.ends_with("z", 1));
+    EXPECT_TRUE(str.starts_with("", 0));
+    EXPECT_TRUE(str.ends_with("", 0));
+}
+
+TEST(string, growing_format_compares_complete_output) {
+    String str(8);
+    const std::string payload(100, 'x');
+    EXPECT_EQ(str.format_impl(String::FORMAT_GROW, "[%s]:%d", payload.c_str(), -42), 106u);
+    EXPECT_EQ(str.to_std_string(), "[" + payload + "]:-42");
+    const std::string suffix(200, 'y');
+    EXPECT_EQ(str.format_impl(String::FORMAT_GROW | String::FORMAT_APPEND, ":%s", suffix.c_str()), 201u);
+    EXPECT_EQ(str.to_std_string(), "[" + payload + "]:-42:" + suffix);
+    EXPECT_EQ(str.str[str.length], '\0');
+}
+
+TEST(string, repeat_appends_when_existing_capacity_is_exhausted) {
+    String str(8);
+    str.append("prefix:");
+    str.repeat("x", 1, 40);
+    EXPECT_EQ(str.to_std_string(), "prefix:" + std::string(40, 'x'));
+    str.repeat("ab", 2, 3);
+    EXPECT_EQ(str.to_std_string(), "prefix:" + std::string(40, 'x') + "ababab");
 }

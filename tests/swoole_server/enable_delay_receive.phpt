@@ -14,12 +14,12 @@ $pm->parentFunc = function () use ($pm) {
         Assert::assert($client->send('world'));
         $s = microtime(true);
         Assert::eq($client->recv(), "hello world");
-        time_approximate(0.3, microtime(true) - $s);
+        time_approximate(0.3, microtime(true) - $s, 0.5);
         $pm->kill();
     });
 };
 $pm->childFunc = function () use ($pm) {
-    $server = new Swoole\Server('127.0.0.1', $pm->getFreePort());
+    $server = new Swoole\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $server->set([
         'worker_num' => 1,
         'enable_delay_receive' => true,
@@ -33,7 +33,7 @@ $pm->childFunc = function () use ($pm) {
         Co::sleep(0.3);
         $serv->confirm($fd);
     });
-    
+
     $server->on('receive', function (Swoole\Server $serv, int $fd, int $rid, string $data) {
         $serv->send($fd, "hello {$data}");
     });

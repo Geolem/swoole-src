@@ -10,14 +10,16 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
 #include <queue>
+#ifndef _WIN32
 #include <sys/uio.h>
+#endif
 
 namespace swoole {
 
@@ -29,54 +31,59 @@ struct BufferChunk {
     };
 
     Type type;
-    uint32_t length;
-    uint32_t offset;
+    uint32_t length = 0;
+    uint32_t offset = 0;
+    uint32_t size = 0;
     union {
-        char *ptr;
-        void *object;
-        struct {
-            uint32_t val1;
-            uint32_t val2;
-        } data;
-    } value;
-    uint32_t size;
-    void (*destroy)(BufferChunk *chunk);
+        char *str;
+        void *ptr;
+        uint32_t u32;
+        uint64_t u64;
+    } value{};
+
+    BufferChunk(Type type, uint32_t size);
+    ~BufferChunk();
+    BufferChunk(const BufferChunk &) = delete;
+    BufferChunk &operator=(const BufferChunk &) = delete;
+
+    void (*destroy)(BufferChunk *chunk) = nullptr;
 };
 
 class Buffer {
-  private:
-    // 0: donot use chunk
+    // 0: don't use chunk
     uint32_t chunk_size;
     uint32_t total_length = 0;
     std::queue<BufferChunk *> queue_;
 
   public:
-    Buffer(uint32_t chunk_size);
+    explicit Buffer(uint32_t _chunk_size);
     ~Buffer();
+    Buffer(const Buffer &) = delete;
+    Buffer &operator=(const Buffer &) = delete;
 
     BufferChunk *alloc(BufferChunk::Type type, uint32_t size);
 
-    BufferChunk *front() {
+    BufferChunk *front() const {
         return queue_.front();
     }
 
     void pop();
-    void append(const void *data, uint32_t size);
+    void append(const char *data, uint32_t size);
     void append(const struct iovec *iov, size_t iovcnt, off_t offset);
 
-    uint32_t length() {
+    uint32_t length() const {
         return total_length;
     }
 
-    size_t count() {
+    size_t count() const {
         return queue_.size();
     }
 
-    bool empty() {
+    bool empty() const {
         return queue_.empty();
     }
 
-    static bool empty(Buffer *buffer) {
+    static bool empty(const Buffer *buffer) {
         return buffer == nullptr || buffer->queue_.empty();
     }
 };

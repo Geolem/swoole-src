@@ -37,8 +37,8 @@ go(function () {
 	 * Http应用
 	 */
 	$server->handle('/', function ($request, $response) {
-	    var_dump($request);
-		var_dump($request->get);
+// 	    var_dump($request);
+// 		var_dump($request->get);
 		$response->end("<h1>hello world</h1>");
 	});
 
@@ -50,4 +50,4 @@ go(function () {
 	$server->start();
 });
 
-swoole_event_wait();
+Swoole\Event::wait();

@@ -10,15 +10,16 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
 #include "swoole_memory.h"
 
-namespace swoole {
+#include <limits>
 
+namespace swoole {
+struct RingBufferItem;
 struct RingBufferImpl {
     void *memory;
     bool shared;
@@ -30,10 +31,11 @@ struct RingBufferImpl {
     sw_atomic_t free_count;
 
     void collect();
+    RingBufferItem *get_item(uint32_t offset) const;
 };
 
 struct RingBufferItem {
-    uint16_t lock;
+	volatile uint16_t lock;
     uint16_t index;
     uint32_t length;
     char data[0];
@@ -55,28 +57,38 @@ static void swRingBuffer_print(swRingBuffer *object, char *prefix) {
 #endif
 
 RingBuffer::RingBuffer(uint32_t size, bool shared) {
+    if (sw_unlikely(size > std::numeric_limits<uint32_t>::max() - SW_DEFAULT_ALIGNMENT + 1)) {
+        throw Exception(SW_ERROR_INVALID_PARAMS);
+    }
     size = SW_MEM_ALIGNED_SIZE(size);
+    if (sw_unlikely(size <= sizeof(RingBufferImpl) + sizeof(RingBufferItem))) {
+        throw Exception(SW_ERROR_INVALID_PARAMS);
+    }
     void *mem = (shared == 1) ? sw_shm_malloc(size) : sw_malloc(size);
     if (mem == nullptr) {
         throw std::bad_alloc();
     }
 
-    impl = (RingBufferImpl *) mem;
-    mem = (char *) mem + sizeof(*impl);
+    impl = static_cast<RingBufferImpl *>(mem);
+    mem = static_cast<char *>(mem) + sizeof(*impl);
     sw_memset_zero(impl, sizeof(*impl));
 
-    impl->size = size - sizeof(impl);
+    impl->size = size - sizeof(*impl);
     impl->shared = shared;
     impl->memory = mem;
 
-    swDebug("memory: ptr=%p", mem);
+    swoole_debug("memory: ptr=%p", mem);
+}
+
+RingBufferItem *RingBufferImpl::get_item(uint32_t offset) const {
+    return reinterpret_cast<RingBufferItem *>(static_cast<char *>(memory) + offset);
 }
 
 void RingBufferImpl::collect() {
     for (uint32_t i = 0; i < free_count; i++) {
-        RingBufferItem *item = (RingBufferItem*) ((char*) memory + collect_offset);
+        const auto *item = get_item(collect_offset);
         if (item->lock == 0) {
-            uint32_t n_size = item->length + sizeof(RingBufferItem);
+            const uint32_t n_size = item->length + sizeof(RingBufferItem);
             collect_offset += n_size;
             if (collect_offset + sizeof(RingBufferItem) > size || collect_offset >= size) {
                 collect_offset = 0;
@@ -95,7 +107,13 @@ void *RingBuffer::alloc(uint32_t size) {
     RingBufferItem *item;
     uint32_t capacity;
 
+    if (sw_unlikely(size == 0 || size > std::numeric_limits<uint32_t>::max() - SW_DEFAULT_ALIGNMENT + 1)) {
+        return nullptr;
+    }
     size = SW_MEM_ALIGNED_SIZE(size);
+    if (sw_unlikely(size > std::numeric_limits<uint32_t>::max() - sizeof(RingBufferItem))) {
+        return nullptr;
+    }
     uint32_t alloc_size = size + sizeof(RingBufferItem);
 
     if (impl->free_count > 0) {
@@ -103,10 +121,10 @@ void *RingBuffer::alloc(uint32_t size) {
     }
 
     if (impl->status == 0) {
-        if (impl->alloc_offset + alloc_size >= (impl->size - sizeof(RingBufferItem))) {
+        if (impl->alloc_offset + alloc_size > (impl->size - sizeof(RingBufferItem))) {
             uint32_t skip_n = impl->size - impl->alloc_offset;
             if (skip_n >= sizeof(RingBufferItem)) {
-                item = (RingBufferItem *) ((char *) impl->memory + impl->alloc_offset);
+                item = impl->get_item(impl->alloc_offset);
                 item->lock = 0;
                 item->length = skip_n - sizeof(RingBufferItem);
                 sw_atomic_t *free_count = &impl->free_count;
@@ -126,7 +144,7 @@ void *RingBuffer::alloc(uint32_t size) {
         return nullptr;
     }
 
-    item = (RingBufferItem *) ((char *) impl->memory + impl->alloc_offset);
+    item = impl->get_item(impl->alloc_offset);
     item->lock = 1;
     item->length = size;
     item->index = impl->alloc_count;
@@ -134,28 +152,26 @@ void *RingBuffer::alloc(uint32_t size) {
     impl->alloc_offset += alloc_size;
     impl->alloc_count++;
 
-    swDebug("alloc: ptr=%p", (void *) (item->data - (char *) impl->memory));
+    swoole_debug("alloc: ptr=%p", (void *) (item->data - (char *) impl->memory));
 
     return item->data;
 }
 
 void RingBuffer::free(void *ptr) {
-    RingBufferItem *item = (RingBufferItem *) ((char *) ptr - sizeof(RingBufferItem));
+    auto *item = reinterpret_cast<RingBufferItem *>(static_cast<char *>(ptr) - sizeof(RingBufferItem));
 
     assert(ptr >= impl->memory);
-    assert((char *) ptr <= (char *) impl->memory + impl->size);
+    assert(static_cast<char *>(ptr) <= static_cast<char *>(impl->memory) + impl->size);
     assert(item->lock == 1);
 
-    if (item->lock != 1) {
-        swDebug("invalid free: index=%d, ptr=%p", item->index, (void *) (item->data - (char *) impl->memory));
-    } else {
-        item->lock = 0;
+    if (!sw_atomic_cmp_set(&item->lock, 1, 0)) {
+        swoole_debug("invalid free: index=%d, ptr=%p", item->index, (void *) (item->data - (char *) impl->memory));
+        return;
     }
 
-    swDebug("free: ptr=%p", (void *) (item->data - (char *) impl->memory));
+    swoole_debug("free: ptr=%p", (void *) (item->data - (char *) impl->memory));
 
-    sw_atomic_t *free_count = &impl->free_count;
-    sw_atomic_fetch_add(free_count, 1);
+    sw_atomic_fetch_add(&impl->free_count, 1);
 }
 
 RingBuffer::~RingBuffer() {
@@ -166,4 +182,4 @@ RingBuffer::~RingBuffer() {
     }
 }
 
-}
+}  // namespace swoole

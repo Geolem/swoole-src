@@ -4,14 +4,12 @@ swoole_websocket_server: websocket frame pack/unpack
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
-declare(strict_types=1);
-
 require __DIR__ . '/../include/bootstrap.php';
 
 error_reporting(error_reporting() & ~(E_NOTICE));
 
-use Swoole\WebSocket\Frame as f;
-use Swoole\WebSocket\CloseFrame as cf;
+use Swoole\WebSocket\Frame;
+use Swoole\WebSocket\CloseFrame;
 
 for ($i = 1000; $i--;) {
     // generate some rand frames
@@ -19,18 +17,20 @@ for ($i = 1000; $i--;) {
     $data = base64_encode(get_safe_random(mt_rand(0, 128000))) . 'EOL';
     if ($opcode === WEBSOCKET_OPCODE_CLOSE) {
         $code = mt_rand(0, 5000);
-        $data = substr($data, -mt_rand(3, 125), 125);
+        $data = substr($data, -mt_rand(3, 123), 123);
+    } elseif ($opcode === WEBSOCKET_OPCODE_PING || $opcode === WEBSOCKET_OPCODE_PONG) {
+        $data = substr($data, 0, mt_rand(0, 125));
     }
     $finish = !!mt_rand(0, 1);
 
     // pack them
     if (mt_rand(0, 1) || $opcode === WEBSOCKET_OPCODE_CLOSE) {
         if ($opcode === WEBSOCKET_OPCODE_CLOSE) {
-            $frame = new cf;
+            $frame = new CloseFrame;
             $frame->code = $code;
             $frame->reason = $data;
         } else {
-            $frame = new f;
+            $frame = new Frame;
             $frame->data = $data;
         }
         $frame->opcode = $opcode;
@@ -43,24 +43,29 @@ for ($i = 1000; $i--;) {
         if (mt_rand(0, 1)) {
             $packed = (string)$frame;
         } else {
-            $packed = f::pack($frame);
+            $packed = Frame::pack($frame);
         }
     } else {
-        $packed = f::pack($data, $opcode, $finish);
+        $packed = Frame::pack($data, $opcode, $finish);
     }
 
     // unpack
-    $unpacked = f::unpack($packed);
+    $unpacked = Frame::unpack($packed);
 
     // verify
     if ($opcode === WEBSOCKET_OPCODE_CLOSE) {
         Assert::same($unpacked->code, $code);
         Assert::same($unpacked->reason, $data);
-        Assert::true($unpacked->finish);
+        Assert::true($unpacked->finish == SWOOLE_WEBSOCKET_FLAG_FIN);
     } else {
         Assert::same($unpacked->data, $data);
         Assert::same($unpacked->opcode, $opcode);
-        Assert::same($unpacked->finish, $finish);
+        if ($opcode === WEBSOCKET_OPCODE_PING || $opcode === WEBSOCKET_OPCODE_PONG) {
+            Assert::true($unpacked->finish == SWOOLE_WEBSOCKET_FLAG_FIN);
+        } else {
+            Assert::same($unpacked->finish, $finish);
+        }
+
     }
 }
 ?>

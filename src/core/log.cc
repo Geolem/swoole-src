@@ -10,20 +10,51 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
+#include "swoole_process_pool.h"
 
-#include <string.h>
+#include <cstring>
 #include <fcntl.h>
-#include <sys/file.h>
 
 #include <string>
 #include <chrono>  // NOLINT [build/c++11]
 
 namespace swoole {
+
+std::string Logger::get_pretty_name(const std::string &pretty_function, bool strip) {
+    const size_t brackets = pretty_function.find_first_of('(');
+    if (brackets == std::string::npos) {
+        return pretty_function;
+    }
+
+    const size_t begin = pretty_function.substr(0, brackets).rfind(' ') + 1;
+    const size_t end = brackets - begin;
+    if (!strip) {
+        return pretty_function.substr(begin, end);
+    }
+
+    auto method_name = pretty_function.substr(begin, end);
+    size_t count = 0, index = method_name.length();
+    while (true) {
+        index = method_name.rfind("::", index);
+        if (index == std::basic_string<char>::npos) {
+            if (count == 1) {
+                return method_name.substr(method_name.rfind("::") + 2);
+            }
+            break;
+        }
+        count++;
+        if (count == 2) {
+            return method_name.substr(index + 2);
+        }
+        index -= 2;
+    }
+
+    return method_name;
+}
 
 bool Logger::open(const char *_log_file) {
     if (opened) {
@@ -38,10 +69,14 @@ bool Logger::open(const char *_log_file) {
         log_real_file = log_file;
     }
 
-    log_fd = ::open(log_real_file.c_str(), O_APPEND | O_RDWR | O_CREAT, 0666);
+    auto log_fd = ::open(log_real_file.c_str(), O_APPEND | O_RDWR | O_CREAT, 0666);
     if (log_fd < 0) {
-        printf("open(%s) failed. Error: %s[%d]\n", log_real_file.c_str(), strerror(errno), errno);
-        log_fd = STDOUT_FILENO;
+        swoole_error_log(SW_LOG_WARNING,
+                         SW_ERROR_SYSTEM_CALL_FAIL,
+                         "open('%s') failed. Error: %s[%d]",
+                         log_real_file.c_str(),
+                         strerror(errno),
+                         errno);
         opened = false;
         log_file = "";
         log_real_file = "";
@@ -49,21 +84,29 @@ bool Logger::open(const char *_log_file) {
         return false;
     } else {
         opened = true;
+        log_fp = fdopen(log_fd, "a");
 
         return true;
     }
 }
 
-void Logger::close(void) {
+void Logger::set_stream(FILE *stream) {
     if (opened) {
-        ::close(log_fd);
-        log_fd = STDOUT_FILENO;
+        close();
+    }
+    log_fp = stream;
+}
+
+void Logger::close() {
+    if (opened) {
+        fclose(log_fp);
+        log_fp = stdout;
         log_file = "";
         opened = false;
     }
 }
 
-int Logger::get_level() {
+int Logger::get_level() const {
     return log_level;
 }
 
@@ -81,39 +124,39 @@ void Logger::set_rotation(int _rotation) {
     log_rotation = _rotation;
 }
 
-bool Logger::redirect_stdout_and_stderr(int enable) {
+bool Logger::redirect_stdout_and_stderr(bool enable) {
     if (enable) {
         if (!opened) {
-            swWarn("no log file opened");
+            swoole_warning("no log file opened");
             return false;
         }
         if (redirected) {
-            swWarn("has been redirected");
+            swoole_warning("has been redirected");
             return false;
         }
         if ((stdout_fd = dup(STDOUT_FILENO)) < 0) {
-            swSysWarn("dup(STDOUT_FILENO) failed");
+            swoole_sys_warning("dup(STDOUT_FILENO) failed");
             return false;
         }
         if ((stderr_fd = dup(STDERR_FILENO)) < 0) {
-            swSysWarn("dup(STDERR_FILENO) failed");
+            swoole_sys_warning("dup(STDERR_FILENO) failed");
             return false;
         }
-        swoole_redirect_stdout(log_fd);
+        swoole_redirect_stdout(fileno(log_fp));
         redirected = true;
     } else {
         if (!redirected) {
-            swWarn("no redirected");
+            swoole_warning("no redirected");
             return false;
         }
         if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
-            swSysWarn("dup2(STDOUT_FILENO) failed");
+            swoole_sys_warning("dup2(STDOUT_FILENO) failed");
         }
         if (dup2(stderr_fd, STDERR_FILENO) < 0) {
-            swSysWarn("dup2(STDERR_FILENO) failed");
+            swoole_sys_warning("dup2(STDERR_FILENO) failed");
         }
-        ::close(stdout_fd);
-        ::close(stderr_fd);
+        sw_close_file(stdout_fd);
+        sw_close_file(stderr_fd);
         stdout_fd = -1;
         stderr_fd = -1;
         redirected = false;
@@ -153,10 +196,7 @@ void Logger::set_date_with_microseconds(bool enable) {
     date_with_microseconds = enable;
 }
 
-/**
- * reopen log file
- */
-void Logger::reopen() {
+void Logger::reopen_without_lock() {
     if (!opened) {
         return;
     }
@@ -164,23 +204,25 @@ void Logger::reopen() {
     std::string new_log_file(log_file);
     close();
     open(new_log_file.c_str());
-    /**
-     * redirect STDOUT & STDERR to log file
-     */
     if (redirected) {
-        swoole_redirect_stdout(log_fd);
+        swoole_redirect_stdout(fileno(log_fp));
     }
+}
+
+void Logger::reopen() {
+    std::unique_lock<std::mutex> _lock(lock);
+    reopen_without_lock();
 }
 
 const char *Logger::get_real_file() {
     return log_real_file.c_str();
 }
 
-const char *Logger::get_file() {
+const char *Logger::get_file() const {
     return log_file.c_str();
 }
 
-std::string Logger::gen_real_file(const std::string &file) {
+std::string Logger::gen_real_file(const std::string &file) const {
     char date_str[16];
     auto now_sec = ::time(nullptr);
     const char *fmt;
@@ -207,7 +249,7 @@ std::string Logger::gen_real_file(const std::string &file) {
     return real_file;
 }
 
-bool Logger::is_opened() {
+bool Logger::is_opened() const {
     return opened;
 }
 
@@ -215,7 +257,6 @@ void Logger::put(int level, const char *content, size_t length) {
     const char *level_str;
     char date_str[SW_LOG_DATE_STRLEN];
     char log_str[SW_LOG_BUFFER_SIZE];
-    int n;
 
     if (level < log_level) {
         return;
@@ -249,69 +290,61 @@ void Logger::put(int level, const char *content, size_t length) {
 
     if (log_rotation) {
         std::string tmp = gen_real_file(log_file);
-        if (tmp != log_real_file) {
-            reopen();
+        /**
+         * If the current thread fails to acquire the lock, it will forgo executing the log rotation.
+         */
+        if (tmp != log_real_file && lock.try_lock()) {
+            reopen_without_lock();
+            lock.unlock();
         }
     }
 
     if (date_with_microseconds) {
         auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-        l_data_str +=
-            sw_snprintf(date_str + l_data_str, SW_LOG_DATE_STRLEN - l_data_str, "<.%lld>", (long long) now_us - now_sec * 1000000);
+        l_data_str += sw_snprintf(
+            date_str + l_data_str, SW_LOG_DATE_STRLEN - l_data_str, "<.%lld>", (long long) now_us - now_sec * 1000000);
     }
 
-    char process_flag = '@';
-    int process_id = 0;
+#ifdef _WIN32
+    int worker_id = 0;
+    pid_t worker_pid = GetCurrentProcessId();
+    char worker_symbol = '*';
+#else
+    int worker_id = swoole_get_worker_id();
+    pid_t worker_pid = swoole_get_worker_pid();
+    if (worker_pid == 0) {
+        worker_pid = getpid();
+    }
+    char worker_symbol = swoole_get_worker_symbol();
+#endif
 
-    switch (swoole_get_process_type()) {
-    case SW_PROCESS_MASTER:
-        process_flag = '#';
-        process_id = swoole_get_thread_id();
-        break;
-    case SW_PROCESS_MANAGER:
-        process_flag = '$';
-        break;
-    case SW_PROCESS_WORKER:
-        process_flag = '*';
-        process_id = swoole_get_process_id();
-        break;
-    case SW_PROCESS_TASKWORKER:
-        process_flag = '^';
-        process_id = swoole_get_process_id();
-        break;
-    default:
-        break;
-    }
+    size_t n = sw_snprintf(log_str,
+                           SW_LOG_BUFFER_SIZE,
+                           "[%.*s %c%d.%d]\t%s\t%.*s\n",
+                           static_cast<int>(l_data_str),
+                           date_str,
+                           worker_symbol,
+                           worker_pid,
+                           worker_id,
+                           level_str,
+                           static_cast<int>(length),
+                           content);
 
-    n = sw_snprintf(log_str,
-                    SW_LOG_BUFFER_SIZE,
-                    "[%.*s %c%d.%d]\t%s\t%.*s\n",
-                    static_cast<int>(l_data_str),
-                    date_str,
-                    process_flag,
-                    SwooleG.pid,
-                    process_id,
-                    level_str,
-                    static_cast<int>(length),
-                    content);
+    lock.lock();
+    if (opened) {
+#ifndef _WIN32
+        flockfile(log_fp);
+#endif
+    }
+    fwrite(log_str, n, 1, log_fp);
+    fflush(log_fp);
+    if (opened) {
+#ifndef _WIN32
+        funlockfile(log_fp);
+#endif
+    }
+    lock.unlock();
 
-    if (opened && flock(log_fd, LOCK_EX) == -1) {
-        printf("flock(%d, LOCK_EX) failed. Error: %s[%d]\n", log_fd, strerror(errno), errno);
-        goto _print;
-    }
-    if (write(log_fd, log_str, n) < 0) {
-    _print:
-        printf("write(log_fd=%d, size=%d) failed. Error: %s[%d].\nMessage: %.*s\n",
-               log_fd,
-               n,
-               strerror(errno),
-               errno,
-               n,
-               log_str);
-    }
-    if (opened && flock(log_fd, LOCK_UN) == -1) {
-        printf("flock(%d, LOCK_UN) failed. Error: %s[%d]\n", log_fd, strerror(errno), errno);
-    }
     if (display_backtrace_) {
         swoole_print_backtrace();
     }

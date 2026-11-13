@@ -42,7 +42,9 @@ $pm->childFunc = function () use ($pm) {
             Assert::same($request->getContent(), 'hello');
             $response->end('world');
         });
+        $pm->onChildStop([$server, 'shutdown']);
 
+        $pm->wakeup();
         $server->start();
     });
 };

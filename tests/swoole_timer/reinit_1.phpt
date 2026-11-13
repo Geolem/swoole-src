@@ -1,14 +1,17 @@
 --TEST--
 swoole_timer: reinit [1]
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_class_not_exist(Swoole\Server::class);
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
 use Swoole\Timer;
 
-const RES_FILE = __DIR__ . '/result.txt';
+const RES_FILE = __DIR__ . '/reinit_1.result';
 file_put_contents(RES_FILE, "");
 
 $pm = new ProcessManager;
@@ -26,7 +29,7 @@ $pm->parentFunc = function ($pid) use ($pm) {
     }
 };
 $pm->childFunc = function () use ($pm) {
-    $server = new Swoole\Server("0.0.0.0", $pm->getFreePort());
+    $server = new Swoole\Server("0.0.0.0", $pm->getFreePort(), SWOOLE_PROCESS);
     $server->set([
         'worker_num' => 1,
         'log_file' => '/dev/null',

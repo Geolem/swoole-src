@@ -10,7 +10,7 @@ skip_if_in_valgrind();
 <?php
 require __DIR__ . "/../include/bootstrap.php";
 use Swoole\Server;
-const WORKER_PROC_NAME = 'swoole_unittest_server_user_process';
+define('WORKER_PROC_NAME', 'swoole_unittest_server_user_process_' . getmypid());
 $pm = new SwooleTest\ProcessManager;
 
 $pm->parentFunc = function ($pid) use ($pm) {
@@ -18,7 +18,7 @@ $pm->parentFunc = function ($pid) use ($pm) {
     {
         //杀死进程
         kill_process_by_name(WORKER_PROC_NAME);
-        usleep(10000);
+        usleep(100 * 1000);
         //判断进程是否存在
         Assert::assert(get_process_pid_by_name(WORKER_PROC_NAME) > 0);
     }
@@ -31,13 +31,13 @@ $pm->childFunc = function () use ($pm)
 //    $serv->set(
 //        ['log_file' => TEST_LOG_FILE,]
 //    );
-    $process2 = new swoole_process(function ($worker) use ($serv, $pm) {
+    $process2 = new Swoole\Process(function ($worker) use ($serv, $pm) {
         global $argv;
         swoole_set_process_name(WORKER_PROC_NAME);
-        swoole_process::signal(SIGTERM, function () {
-            swoole_event_exit();
+        Swoole\Process::signal(SIGTERM, function () {
+            Swoole\Event::exit();
         });
-        swoole_timer_after(200000, function ($interval) use ($worker, $serv) {
+        Swoole\Timer::after(200000, function ($interval) use ($worker, $serv) {
             echo "OK\n";
         });
         $pm->wakeup();

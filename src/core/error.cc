@@ -10,16 +10,18 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
-#include <string>
-
 #include "swoole.h"
 
+#include <unordered_set>
+
+static std::unordered_set<int> ignored_errors;
+
 namespace swoole {
-Exception::Exception(int code) : code(code) {
+Exception::Exception(const int code) noexcept : code(code) {
     msg = swoole_strerror(code);
 }
 }  // namespace swoole
@@ -28,9 +30,9 @@ const char *swoole_strerror(int code) {
     if (code < SW_ERROR_BEGIN) {
         return strerror(code);
     }
+	static thread_local char buffer[32];
     /* swstrerror {{{*/
-    switch(code)
-    {
+    switch (code) {
     case SW_ERROR_MALLOC_FAIL:
         return "Malloc fail";
     case SW_ERROR_SYSTEM_CALL_FAIL:
@@ -49,24 +51,52 @@ const char *swoole_strerror(int code) {
         return "Protocol error";
     case SW_ERROR_WRONG_OPERATION:
         return "Wrong operation";
+    case SW_ERROR_PHP_RUNTIME_NOTICE:
+        return "PHP runtime notice";
+    case SW_ERROR_FOR_TEST:
+        return "For test";
+    case SW_ERROR_NO_PAYLOAD:
+        return "No payload";
+    case SW_ERROR_UNDEFINED_BEHAVIOR:
+        return "Undefined behavior";
+    case SW_ERROR_NOT_THREAD_SAFETY:
+        return "Not thread safety";
     case SW_ERROR_FILE_NOT_EXIST:
         return "File not exist";
     case SW_ERROR_FILE_TOO_LARGE:
         return "File too large";
     case SW_ERROR_FILE_EMPTY:
         return "File empty";
+    case SW_ERROR_DIR_NOT_EXIST:
+        return "Dir not exist";
     case SW_ERROR_DNSLOOKUP_DUPLICATE_REQUEST:
         return "DNS Lookup duplicate request";
     case SW_ERROR_DNSLOOKUP_RESOLVE_FAILED:
         return "DNS Lookup resolve failed";
     case SW_ERROR_DNSLOOKUP_RESOLVE_TIMEOUT:
         return "DNS Lookup resolve timeout";
+    case SW_ERROR_DNSLOOKUP_UNSUPPORTED:
+        return "DNS Lookup unsupported";
+    case SW_ERROR_DNSLOOKUP_NO_SERVER:
+        return "DNS Lookup no server";
     case SW_ERROR_BAD_IPV6_ADDRESS:
         return "Bad ipv6 address";
     case SW_ERROR_UNREGISTERED_SIGNAL:
         return "Unregistered signal";
-    case SW_ERROR_EVENT_SOCKET_REMOVED:
-        return "Event socket removed";
+    case SW_ERROR_BAD_HOST_ADDR:
+        return "Bad host addr";
+    case SW_ERROR_BAD_PORT:
+        return "Bad port";
+    case SW_ERROR_BAD_SOCKET_TYPE:
+        return "Bad socket type";
+    case SW_ERROR_EVENT_REMOVE_FAILED:
+        return "Event remove failed";
+    case SW_ERROR_EVENT_ADD_FAILED:
+        return "Event add failed";
+    case SW_ERROR_EVENT_UPDATE_FAILED:
+        return "Event update failed";
+    case SW_ERROR_EVENT_UNKNOWN_DATA:
+        return "Event unknown data";
     case SW_ERROR_SESSION_CLOSED_BY_SERVER:
         return "Session closed by server";
     case SW_ERROR_SESSION_CLOSED_BY_CLIENT:
@@ -103,12 +133,18 @@ const char *swoole_strerror(int code) {
         return "SSL reset";
     case SW_ERROR_SSL_HANDSHAKE_FAILED:
         return "SSL handshake failed";
+    case SW_ERROR_SSL_CREATE_CONTEXT_FAILED:
+        return "SSL create context failed";
+    case SW_ERROR_SSL_CREATE_SESSION_FAILED:
+        return "SSL create session failed";
     case SW_ERROR_PACKAGE_LENGTH_TOO_LARGE:
         return "Package length too large";
     case SW_ERROR_PACKAGE_LENGTH_NOT_FOUND:
         return "Package length not found";
     case SW_ERROR_DATA_LENGTH_TOO_LARGE:
         return "Data length too large";
+    case SW_ERROR_PACKAGE_MALFORMED_DATA:
+        return "Package malformed data";
     case SW_ERROR_TASK_PACKAGE_TOO_BIG:
         return "Task package too big";
     case SW_ERROR_TASK_DISPATCH_FAIL:
@@ -123,6 +159,10 @@ const char *swoole_strerror(int code) {
         return "Http2 stream not found";
     case SW_ERROR_HTTP2_STREAM_IGNORE:
         return "Http2 stream ignore";
+    case SW_ERROR_HTTP2_SEND_CONTROL_FRAME_FAILED:
+        return "Http2 send control frame failed";
+    case SW_ERROR_HTTP2_INTERNAL_ERROR:
+        return "Http2 internal error";
     case SW_ERROR_AIO_BAD_REQUEST:
         return "Aio bad request";
     case SW_ERROR_AIO_CANCELED:
@@ -135,6 +175,8 @@ const char *swoole_strerror(int code) {
         return "Socket closed";
     case SW_ERROR_SOCKET_POLL_TIMEOUT:
         return "Socket poll timeout";
+    case SW_ERROR_SOCKET_NOT_EXISTS:
+        return "Socket not exists";
     case SW_ERROR_SOCKS5_UNSUPPORT_VERSION:
         return "Socks5 unsupport version";
     case SW_ERROR_SOCKS5_UNSUPPORT_METHOD:
@@ -145,6 +187,8 @@ const char *swoole_strerror(int code) {
         return "Socks5 server error";
     case SW_ERROR_SOCKS5_HANDSHAKE_FAILED:
         return "Socks5 handshake failed";
+    case SW_ERROR_SOCKS5_CONNECT_FAILED:
+        return "Socks5 connect failed";
     case SW_ERROR_HTTP_PROXY_HANDSHAKE_ERROR:
         return "Http proxy handshake error";
     case SW_ERROR_HTTP_INVALID_PROTOCOL:
@@ -153,6 +197,12 @@ const char *swoole_strerror(int code) {
         return "Http proxy handshake failed";
     case SW_ERROR_HTTP_PROXY_BAD_RESPONSE:
         return "Http proxy bad response";
+    case SW_ERROR_HTTP_CONFLICT_HEADER:
+        return "Http conflict header";
+    case SW_ERROR_HTTP_CONTEXT_UNAVAILABLE:
+        return "Http context unavailable";
+    case SW_ERROR_HTTP_COOKIE_UNAVAILABLE:
+        return "Http cookie unavailable";
     case SW_ERROR_WEBSOCKET_BAD_CLIENT:
         return "Websocket bad client";
     case SW_ERROR_WEBSOCKET_BAD_OPCODE:
@@ -161,6 +211,12 @@ const char *swoole_strerror(int code) {
         return "Websocket unconnected";
     case SW_ERROR_WEBSOCKET_HANDSHAKE_FAILED:
         return "Websocket handshake failed";
+    case SW_ERROR_WEBSOCKET_PACK_FAILED:
+        return "Websocket pack failed";
+    case SW_ERROR_WEBSOCKET_UNPACK_FAILED:
+        return "Websocket unpack failed";
+    case SW_ERROR_WEBSOCKET_INCOMPLETE_PACKET:
+        return "Websocket incomplete packet";
     case SW_ERROR_SERVER_MUST_CREATED_BEFORE_CLIENT:
         return "Server must created before client";
     case SW_ERROR_SERVER_TOO_MANY_SOCKET:
@@ -183,8 +239,22 @@ const char *swoole_strerror(int code) {
         return "Server invalid request";
     case SW_ERROR_SERVER_CONNECT_FAIL:
         return "Server connect fail";
+    case SW_ERROR_SERVER_INVALID_COMMAND:
+        return "Server invalid command";
+    case SW_ERROR_SERVER_IS_NOT_REGULAR_FILE:
+        return "Server is not regular file";
+    case SW_ERROR_SERVER_SEND_TO_WOKER_TIMEOUT:
+        return "Server send to woker timeout";
+    case SW_ERROR_SERVER_INVALID_CALLBACK:
+        return "Server invalid callback";
+    case SW_ERROR_SERVER_UNRELATED_THREAD:
+        return "Server unrelated thread";
     case SW_ERROR_SERVER_WORKER_EXIT_TIMEOUT:
         return "Server worker exit timeout";
+    case SW_ERROR_SERVER_WORKER_ABNORMAL_PIPE_DATA:
+        return "Server worker abnormal pipe data";
+    case SW_ERROR_SERVER_WORKER_UNPROCESSED_DATA:
+        return "Server worker unprocessed data";
     case SW_ERROR_CO_OUT_OF_COROUTINE:
         return "Coroutine out of coroutine";
     case SW_ERROR_CO_HAS_BEEN_BOUND:
@@ -213,8 +283,17 @@ const char *swoole_strerror(int code) {
         return "Coroutine std thread link error";
     case SW_ERROR_CO_DISABLED_MULTI_THREAD:
         return "Coroutine disabled multi thread";
+    case SW_ERROR_CO_CANNOT_CANCEL:
+        return "Coroutine cannot cancel";
+    case SW_ERROR_CO_NOT_EXISTS:
+        return "Coroutine not exists";
+    case SW_ERROR_CO_CANCELED:
+        return "Coroutine canceled";
+    case SW_ERROR_CO_TIMEDOUT:
+        return "Coroutine timedout";
+    case SW_ERROR_CO_SOCKET_CLOSE_WAIT:
+        return "Coroutine socket close wait";
     default:
-        static char buffer[32];
 #ifndef __MACH__
         snprintf(buffer, sizeof(buffer), "Unknown error %d", code);
 #else
@@ -222,9 +301,25 @@ const char *swoole_strerror(int code) {
 #endif
         return buffer;
     }
-/*}}}*/
+    /*}}}*/
 }
 
 void swoole_throw_error(int code) {
     throw swoole::Exception(code);
+}
+
+void swoole_ignore_error(int code) {
+    ignored_errors.insert(code);
+}
+
+bool swoole_is_ignored_error(const int code) {
+    return ignored_errors.find(code) != ignored_errors.end();
+}
+
+void swoole_clear_last_error_msg() {
+    sw_error[0] = '\0';
+}
+
+const char *swoole_get_last_error_msg() {
+    return sw_error;
 }

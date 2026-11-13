@@ -1,10 +1,15 @@
 --TEST--
 swoole_coroutine_scheduler: start in server onShutdown callback
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_class_not_exist(Swoole\Server::class);
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
+
+use Swoole\Coroutine\System;
 
 $file = file_get_contents(__FILE__);
 
@@ -13,10 +18,10 @@ $server->set(['worker_num' => 2, 'log_level' => SWOOLE_LOG_WARNING,]);
 
 $server->on('WorkerStart', function (Swoole\Server $server, int $worker_id) use ($file) {
     if ($worker_id == 1) {
-        $server->after(200, function () use ($server, $file) {
-            Co::sleep(0.1);
+        Swoole\Timer::after(200, function () use ($server, $file) {
+            System::sleep(0.1);
             echo "[1] Co " . Co::getCid() . "\n";
-            Assert::same(Co::readFile(__FILE__), $file);
+            Assert::same(System::readFile(__FILE__), $file);
             $server->shutdown();
         });
     }
@@ -29,9 +34,9 @@ $server->on('workerStop', function (Swoole\Server $server, int $worker_id) use (
     if ($worker_id == 1) {
         $sch = new Co\Scheduler;
         $sch->add(function ($t, $n) use ($file) {
-            Co::sleep($t);
+            System::sleep($t);
             echo "[2] Co " . Co::getCid() . "\n";
-            Assert::same(Co::readFile(__FILE__), $file);
+            Assert::same(System::readFile(__FILE__), $file);
         }, 0.05, 'A');
         $sch->start();
     }

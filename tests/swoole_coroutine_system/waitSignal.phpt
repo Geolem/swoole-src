@@ -1,7 +1,10 @@
 --TEST--
 swoole_coroutine_system: waitSignal
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_win();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
@@ -32,13 +35,13 @@ Coroutine\run(function () use ($atomic) {
     switch_process();
     $atomic->wakeup();
     echo "1\n";
-    Assert::true(System::waitSignal(SIGUSR1));
+    Assert::eq(System::waitSignal(SIGUSR1), SIGUSR1);
     echo "3\n";
     Assert::false(System::waitSignal(SIGUSR2, 0.01));
     echo "4\n";
     $atomic->wakeup();
     echo "5\n";
-    Assert::true(System::waitSignal(SIGUSR2));
+    Assert::eq(System::waitSignal(SIGUSR2), SIGUSR2);
     echo "7\n";
     System::wait();
     echo "9\n";

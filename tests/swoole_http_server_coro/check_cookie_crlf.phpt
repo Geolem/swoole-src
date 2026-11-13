@@ -47,6 +47,7 @@ $pm->childFunc = function () use ($pm) {
             $response->end('hello world');
         });
 
+        $pm->wakeup();
         $server->start();
     });
 };
@@ -54,5 +55,5 @@ $pm->childFirst();
 $pm->run();
 ?>
 --EXPECTF--
-Warning: Swoole\Http\Response::rawcookie(): Header may not contain more than a single header, new line detected in %s
+Warning: Swoole\Http\Response::rawcookie(): The value cannot contain ",", ";", " ", "\t", "\r", "\n", "\013", or "\014" in %s
 DONE

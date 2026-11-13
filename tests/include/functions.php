@@ -1,40 +1,69 @@
 <?php
 /**
- * This file is part of Swoole, for internal use only
+ * This file is part of Swoole.
  *
  * @link     https://www.swoole.com
  * @contact  team@swoole.com
  * @license  https://github.com/swoole/library/blob/master/LICENSE
  */
 
+declare(strict_types=1);
+
+use Swoole\Coroutine\Client;
+use Swoole\Coroutine\Socket;
+use Swoole\Event;
+use Swoole\Http2\Request;
+use Swoole\Process;
+use Swoole\Runtime;
+use Swoole\Thread;
+use Swoole\Timer;
+
+/**
+ * This file is part of Swoole, for internal use only
+ *
+ * @see     https://www.swoole.com
+ * @contact  team@swoole.com
+ * @license  https://github.com/swoole/library/blob/master/LICENSE
+ */
+
 require_once __DIR__ . '/config.php';
 
-function switch_process()
+function switch_process(): void
 {
     usleep((USE_VALGRIND ? 100 : 25) * 1000);
 }
 
 function clear_php()
 {
-    `ps -A | grep php | grep -v phpstorm | grep -v 'run-tests' | awk '{print $1}' | xargs kill -9 > /dev/null 2>&1`;
+    if (is_win()) {
+        return;
+    }
+    shell_exec("ps -A | grep php | grep -v phpstorm | grep -v 'run-tests' | awk '{print $1}' | xargs kill -9 > /dev/null 2>&1");
+}
+
+function puts($msg)
+{
+    echo $msg . "\n";
 }
 
 function top(int $pid)
 {
+    if (is_win()) {
+        return false;
+    }
     static $available;
-    $available = $available ?? !(IS_MAC_OS || empty(`top help 2>&1 | grep -i usage`));
+    $available = $available ?? !(IS_MAC_OS || empty(shell_exec('top help 2>&1 | grep -i usage')));
     if (!$available) {
         return false;
     }
-    do {
-        $top = @`top -b -n 1 -p {$pid}`;
+    while (true) {
+        $top = @shell_exec("top -b -n 1 -p {$pid}");
         if (empty($top)) {
             trigger_error("top {$pid} failed: " . swoole_strerror(swoole_errno()), E_USER_WARNING);
             return false;
-        } else {
-            break;
         }
-    } while (true);
+        break;
+    }
     $top = explode("\n", $top);
     $top = array_combine(preg_split('/\s+/', trim($top[6])), preg_split('/\s+/', trim($top[7])));
     return $top;
@@ -42,70 +71,264 @@ function top(int $pid)
 
 function is_busybox_ps(): bool
 {
+    if (is_win()) {
+        return false;
+    }
     static $bool;
-    $bool = $bool ?? !empty(`ps --help 2>&1 | grep -i busybox`);
+    $bool = $bool ?? !empty(shell_exec('ps --help 2>&1 | grep -i busybox'));
     return $bool;
 }
 
 function kill_process_by_name(string $name)
 {
+    if (is_win()) {
+        return;
+    }
     shell_exec('ps aux | grep "' . $name . '" | grep -v grep | awk \'{ print $' . (is_busybox_ps() ? '1' : '2') . '}\' | xargs kill');
 }
 
-function get_process_pid_by_name(string $name): bool
+function get_process_pid_by_name(string $name): int
 {
-    return (int)shell_exec('ps aux | grep "' . $name . '" | grep -v grep | awk \'{ print $' . (is_busybox_ps() ? '1' : '2') . '}\'');
+    if (is_win()) {
+        return 0;
+    }
+    return (int) shell_exec('ps aux | grep "' . $name . '" | grep -v grep | awk \'{ print $' . (is_busybox_ps() ? '1' : '2') . '}\'');
 }
 
 function is_musl_libc(): bool
 {
+    if (is_win()) {
+        return false;
+    }
     static $bool;
-    $bool = $bool ?? !empty(`ldd 2>&1 | grep -i musl`);
+    $bool = $bool ?? !empty(shell_exec('ldd 2>&1 | grep -i musl'));
     return $bool;
 }
 
-function get_one_free_port(): int
+function is_win(): bool
 {
-    $hookFlags = Swoole\Runtime::getHookFlags();
-    Swoole\Runtime::enableCoroutine(false);
-    $server = @stream_socket_server('tcp://127.0.0.1:0');
-    if (!$server) {
-        $port = -1;
-    } else {
-        $name = stream_socket_get_name($server, false);
-        if (empty($name)) {
-            $port = -1;
+    static $bool;
+    $bool = $bool ?? (stripos(PHP_OS, 'WIN') === 0);
+    return $bool;
+}
+
+function get_server_ips(): array
+{
+    $ips = [];
+
+    if (is_win()) {
+        $output = shell_exec('ipconfig');
+        if ($output) {
+            preg_match_all('/IPv4 Address[.\s]*: (\d+\.\d+\.\d+\.\d+)/', $output, $matches);
+            $ips = $matches[1] ?? [];
         }
-        else {
-            $port = (parse_url($name)['port'] ?? -1) ?: -1;
+    } else {
+        switch(PHP_OS_FAMILY) {
+            case 'Darwin':
+                $output = shell_exec('ifconfig');
+                preg_match_all('/inet (\d+\.\d+\.\d+\.\d+)/', $output, $matches);
+                $ips = $matches[1];
+                break;
+            default:
+                $output = shell_exec('ip addr show');
+                preg_match_all('/inet (\d+\.\d+\.\d+\.\d+)\//', $output, $matches);
+                $ips = $matches[1];
+                break;
         }
     }
-    Swoole\Runtime::enableCoroutine($hookFlags);
+
+    $ips = array_filter($ips, function($ip) {
+        if ($ip == "127.0.0.1") {
+            return false;
+        }
+        return true;
+    });
+
+    $ips = array_merge(["127.0.0.1"], $ips);
+
+    return $ips;
+}
+
+/**
+ * The range used by the probed test ports, it always stays below the local ephemeral
+ * port range(net.ipv4.ip_local_port_range), see get_one_free_port().
+ */
+function get_test_port_range(): array
+{
+    $min = 10000;
+    $max = 32000;
+    $rangeFile = '/proc/sys/net/ipv4/ip_local_port_range';
+    if (is_readable($rangeFile) && preg_match('/(\d+)\s+(\d+)/', (string) file_get_contents($rangeFile), $match)) {
+        $max = min($max, (int) $match[1] - 1);
+    }
+    if ($max <= $min) {
+        $max = $min + 1000;
+    }
+    return [$min, $max];
+}
+
+/**
+ * The snapshot of the ports which are currently occupied.
+ *
+ * It is read from the procfs and covers both TCP and UDP, because the same port can be
+ * occupied by a UDP test server. Notice: it is only a snapshot, the ports may change at
+ * any time, so it is used to skip the obviously busy candidates and the authoritative
+ * check is still the bind() probe in find_free_port().
+ */
+function get_used_ports(): array
+{
+    $ports = [];
+    foreach (['tcp', 'tcp6', 'udp', 'udp6'] as $protocol) {
+        $path = "/proc/net/{$protocol}";
+        if (!is_readable($path)) {
+            continue;
+        }
+        $lines = file($path);
+        if (!$lines) {
+            continue;
+        }
+        foreach ($lines as $line) {
+            // the local address column looks like "0100007F:1F90"
+            $columns = preg_split('/\s+/', trim($line));
+            if (!isset($columns[1]) || strpos($columns[1], ':') === false) {
+                continue;
+            }
+            $ports[(int) hexdec(explode(':', $columns[1])[1])] = true;
+        }
+    }
+    return $ports;
+}
+
+/**
+ * Sweep the test port range and return the first port which passes $probe.
+ *
+ * The ports which are known to be busy are skipped, so in the common case the probe
+ * succeeds at the first attempt and the sweep is just a fallback. The range is swept from
+ * a per-process offset, so the parallel test workers do not fight for the same ports.
+ *
+ * @param callable(int): bool $probe
+ * @return int the port, or -1 if there is no free port
+ */
+function find_free_port(callable $probe): int
+{
+    /**
+     * The ports handed out by this process, they are kept reserved until the server binds
+     * them, otherwise two servers of the same test may get the same port.
+     */
+    static $handed_out = [];
+    $owner = function_exists('posix_geteuid') ? (string) posix_geteuid() : 'windows';
+    $directory = sys_get_temp_dir() . '/swoole-test-ports-' . $owner;
+    if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException("Unable to create port reservation directory: $directory");
+    }
+    [$min, $max] = get_test_port_range();
+    $used = get_used_ports();
+    $size = $max - $min + 1;
+    $offset = getmypid() % $size;
+    for ($i = 0; $i < $size; $i++) {
+        $port = $min + ($offset + $i) % $size;
+        if (isset($used[$port]) || isset($handed_out[$port])) {
+            continue;
+        }
+        if ($probe($port)) {
+            $reservation = fopen($directory . '/' . $port, 'c');
+            if ($reservation === false) {
+                throw new RuntimeException("Unable to reserve test port $port");
+            }
+            if (!flock($reservation, LOCK_EX | LOCK_NB)) {
+                fclose($reservation);
+                continue;
+            }
+            // The first bind probe and the reservation are separate operations.
+            if (!$probe($port)) {
+                flock($reservation, LOCK_UN);
+                fclose($reservation);
+                continue;
+            }
+            // Retain the lock across fork and until both fixture processes have exited.
+            $handed_out[$port] = $reservation;
+            return $port;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Probe a free port which does NOT come from the local ephemeral port range.
+ *
+ * The port is only probed here but bound later, by the server process, so it must not
+ * come from the ephemeral range: the kernel hands those out to every outgoing
+ * connection, and a parallel test can occupy the port in the window between the probe
+ * and the bind. The server then fails to listen and the client gets ECONNREFUSED.
+ * Ports below the range are only used by the test servers themselves.
+ */
+function get_one_free_port(): int
+{
+    /**
+     * The Swoole coroutine socket delays releasing file descriptors (fd),
+     * which prevents ports from being released immediately.
+     * Therefore, it is essential to disable runtime hooks.
+     */
+    $flags = Runtime::getHookFlags();
+    if ($flags !== 0) {
+        Runtime::enableCoroutine(0);
+    }
+
+    $port = find_free_port(function (int $port): bool {
+        $socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP) or exit('Unable to create socket: ' . socket_strerror(socket_last_error()) . PHP_EOL);
+        socket_set_option($socket, SOL_SOCKET, SO_REUSEADDR, 1) or exit('Unable to set socket option: ' . socket_strerror(socket_last_error()) . PHP_EOL);
+        /**
+         * SO_REUSEPORT must not be set here, it would make the probe succeed on a port
+         * which is already in use by another test server.
+         */
+        $bound = @socket_bind($socket, '127.0.0.1', $port);
+        socket_close($socket);
+        return (bool) $bound;
+    });
+    if ($port < 0) {
+        [$min, $max] = get_test_port_range();
+        exit("Unable to find a free port in [{$min}, {$max}]" . PHP_EOL);
+    }
+
+    if ($flags !== 0) {
+        Runtime::enableCoroutine($flags);
+    }
     return $port;
+}
+
+function get_constant_port(string $str, int $base = 9500): int
+{
+    return $base + crc32($str) % 10000;
 }
 
 function get_one_free_port_ipv6(): int
 {
-    $hookFlags = Swoole\Runtime::getHookFlags();
-    Swoole\Runtime::enableCoroutine(false);
-    $server = @stream_socket_server('tcp://[::1]:0');
-    if (!$server) {
-        $port = -1;
-    } else {
-        $name = stream_socket_get_name($server, false);
-        if (empty($name)) {
-            $port = -1;
-        }
-        else {
-            $port = explode(']:', $name)[1];
-        }
+    $hookFlags = Runtime::getHookFlags();
+    if ($hookFlags !== 0) {
+        Runtime::enableCoroutine(0);
     }
 
-    Swoole\Runtime::enableCoroutine($hookFlags);
+    $port = -1;
+    // IPv6 may be unavailable, do not sweep the whole range in that case
+    if ($server = @stream_socket_server('tcp://[::1]:0')) {
+        fclose($server);
+        $port = find_free_port(function (int $port): bool {
+            $server = @stream_socket_server("tcp://[::1]:{$port}");
+            if (!$server) {
+                return false;
+            }
+            fclose($server);
+            return true;
+        });
+    }
+
+    if ($hookFlags !== 0) {
+        Runtime::enableCoroutine($hookFlags);
+    }
     return $port;
 }
 
-function set_socket_coro_buffer_size(Swoole\Coroutine\Socket $cosocket, int $size)
+function set_socket_coro_buffer_size(Socket $cosocket, int $size)
 {
     $cosocket->setOption(SOL_SOCKET, SO_SNDBUF, $size);
     $cosocket->setOption(SOL_SOCKET, SO_RCVBUF, $size);
@@ -127,7 +350,7 @@ function time_approximate($expect, $actual, float $ratio = 0.1)
 
 function ms_random(float $a, float $b): float
 {
-    return mt_rand($a * 1000, $b * 1000) / 1000;
+    return mt_rand(intval($a * 1000), intval($b * 1000)) / 1000;
 }
 
 function string_pop_front(string &$s, int $length): string
@@ -144,10 +367,18 @@ function array_random(array $array)
 
 function phpt_echo(...$args)
 {
+    if (!SWOOLE_TEST_ECHO) {
+        return;
+    }
     global $argv;
     if (substr($argv[0], -5) === '.phpt') {
         foreach ($args as $arg) {
-            echo $arg;
+            if (!is_string($arg)) {
+                var_export($arg);
+                echo PHP_EOL;
+            } else {
+                echo $arg;
+            }
         }
     }
 }
@@ -155,8 +386,17 @@ function phpt_echo(...$args)
 function phpt_var_dump(...$args)
 {
     global $argv;
-    if (substr($argv[0], -5) === '.phpt') {
+    if (str_ends_with($argv[0], '.phpt')) {
         var_dump(...$args);
+    }
+}
+
+function phpt_show_usage()
+{
+    global $argv;
+    if (str_ends_with($argv[0], '.phpt')) {
+        var_dump('memory:' . memory_get_usage());
+        var_dump('coroutine:' . var_export(co::stats(), true));
     }
 }
 
@@ -166,7 +406,7 @@ function httpPost($url, $data)
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_HEADER, 0);
     curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Expect:'));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Expect:']);
     curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     $res = curl_exec($ch);
@@ -181,12 +421,12 @@ function httpRequest(string $uri, array $options = [])
     $domain = $url_info['host'] ?? '127.0.0.1';
     $path = $url_info['path'] ?? null ?: '/';
     $query = $url_info['query'] ?? null ? "?{$url_info['query']}" : '';
-    $port = (int)($url_info['port'] ?? null ?: 80);
+    $port = (int) ($url_info['port'] ?? null ?: 80);
     $http2 = $options['http2'] ?? false;
     $connect_args = [$domain, $port, $scheme === 'https' || $port === 443];
     if ($http2) {
         $cli = new Swoole\Coroutine\Http2\Client(...$connect_args);
-        $request = new Swoole\Http2\Request;
+        $request = new Request();
     } else {
         $cli = new Swoole\Coroutine\Http\Client(...$connect_args);
         $request = null;
@@ -235,28 +475,27 @@ function httpRequest(string $uri, array $options = [])
             'statusCode' => $response->statusCode,
             'headers' => $response->headers,
             'set_cookie_headers' => $response->set_cookie_headers,
-            'body' => $response->data
-        ];
-    } else {
-        $redirect_times = $options['redirect'] ?? 3;
-        while (true) {
-            if (!$cli->execute($path . $query)) {
-                throw new RuntimeException("HTTP execute {$uri} failed: {$cli->errMsg}");
-            }
-            if ($redirect_times-- && ($cli->headers['location'] ?? null) && $cli->headers['location'][0] === '/') {
-                $path = $cli->headers['location'];
-                $query = '';
-                continue;
-            }
-            break;
-        }
-        return [
-            'statusCode' => $cli->statusCode,
-            'headers' => $cli->headers,
-            'set_cookie_headers' => $cli->set_cookie_headers,
-            'body' => $cli->body
+            'body' => $response->data,
         ];
     }
+    $redirect_times = $options['redirect'] ?? 3;
+    while (true) {
+        if (!$cli->execute($path . $query)) {
+            throw new RuntimeException("HTTP execute {$uri} failed: {$cli->errMsg}");
+        }
+        if ($redirect_times-- && ($cli->headers['location'] ?? null) && $cli->headers['location'][0] === '/') {
+            $path = $cli->headers['location'];
+            $query = '';
+            continue;
+        }
+        break;
+    }
+    return [
+        'statusCode' => $cli->statusCode,
+        'headers' => $cli->headers,
+        'set_cookie_headers' => $cli->set_cookie_headers,
+        'body' => $cli->body,
+    ];
 }
 
 function httpGetStatusCode(string $uri, array $options = [])
@@ -277,7 +516,7 @@ function httpGetBody(string $uri, array $options = [])
 function content_hook_replace(string $content, array $kv_map): string
 {
     foreach ($kv_map as $key => $val) {
-        $content = str_replace("{{{$key}}}", $val, $content);
+        $content = str_replace("{{{$key}}}", (string) $val, $content);
     }
     return $content;
 }
@@ -303,13 +542,12 @@ function tcp_type_length(string $type = 'n'): int
     $map = tcp_length_types();
     if (strlen($type) === 1) {
         return $map[$type] ?? 0;
-    } else {
-        $len = 0;
-        for ($n = 0; $n < strlen($type); $n++) {
-            $len += $map[$type[$n]] ?? 0;
-        }
-        return $len;
     }
+    $len = 0;
+    for ($n = 0; $n < strlen($type); $n++) {
+        $len += $map[$type[$n]] ?? 0;
+    }
+    return $len;
 }
 
 function tcp_head(int $length, string $type = 'n'): string
@@ -359,10 +597,10 @@ function get_big_random(int $length = 1024 * 1024)
     return str_repeat(get_safe_random(1024), $length / 1024);
 }
 
-function makeCoTcpClient($host, $port, callable $onConnect = null, callable $onReceive = null)
+function makeCoTcpClient($host, $port, ?callable $onConnect = null, ?callable $onReceive = null)
 {
     go(function () use ($host, $port, $onConnect, $onReceive) {
-        $cli = new Swoole\Coroutine\Client(SWOOLE_SOCK_TCP);
+        $cli = new Client(SWOOLE_SOCK_TCP);
         assert($cli->set([
             'open_length_check' => 1,
             'package_length_type' => 'N',
@@ -386,7 +624,7 @@ function opcode_encode($op, $data)
 {
     $r = json_encode([$op, $data]);
     Assert::same(json_last_error(), JSON_ERROR_NONE);
-    return pack("N", strlen($r) + 4) . $r;
+    return pack('N', strlen($r) + 4) . $r;
 }
 
 function opcode_decode($raw)
@@ -400,7 +638,7 @@ function opcode_decode($raw)
 
 function kill_self_and_descendant($pid)
 {
-    if (PHP_OS === "Darwin") {
+    if (PHP_OS === 'Darwin') {
         return;
     }
     $pids = findDescendantPids($pid);
@@ -412,20 +650,18 @@ function kill_self_and_descendant($pid)
 
 /**
  * fork 一个进程把父进程pid通过消息队列传给子进程，延时把父进程干掉
- * @param int $after
- * @param int $sig
  */
-function killself_in_syncmode($lifetime = 1000, $sig = SIGKILL)
+function killself_in_syncmode(int $lifetime = 1000, int $sig = SIGKILL): void
 {
-    $proc = new Swoole\Process(function (Swoole\Process $proc) use ($lifetime, $sig) {
+    $proc = new Process(function (Process $proc) use ($lifetime, $sig) {
         $pid = $proc->pop();
         $proc->freeQueue();
         usleep($lifetime * 1000);
-        Swoole\Process::kill($pid, $sig);
+        Process::kill((int) $pid, $sig);
         $proc->exit();
     }, true);
     $proc->useQueue();
-    $proc->push(posix_getpid());
+    $proc->push((string) posix_getpid());
     $proc->start();
 }
 
@@ -433,16 +669,15 @@ function killself_in_syncmode($lifetime = 1000, $sig = SIGKILL)
  * 异步模式用定时器干掉自己
  * @param int $lifetime
  * @param int $sig
- * @param callable $cb
  * @return mixed
  */
-function suicide($lifetime, $sig = SIGKILL, callable $cb = null)
+function suicide($lifetime, $sig = SIGKILL, ?callable $cb = null)
 {
-    return swoole_timer_after($lifetime, function () use ($lifetime, $sig, $cb) {
+    return Timer::after($lifetime, function () use ($lifetime, $sig, $cb) {
         if ($cb) {
             $cb();
         }
-        echo "suicide after $lifetime ms\n";
+        echo "suicide after {$lifetime} ms\n";
         posix_kill(posix_getpid(), $sig);
     });
 }
@@ -450,56 +685,57 @@ function suicide($lifetime, $sig = SIGKILL, callable $cb = null)
 // 查找某pid的所有子孙pid
 function findDescendantPids($pid)
 {
-    list($pinfo,) = pstree();
+    [$pinfo] = pstree();
     $y = function ($pid) use (&$y, $pinfo) {
         if (isset($pinfo[$pid])) {
-            list(, $childs) = $pinfo[$pid];
+            [, $childs] = $pinfo[$pid];
             $pids = $childs;
             foreach ($childs as $child) {
                 $pids = array_merge($pids, $y($child));
             }
             return $pids;
-        } else {
-            return [];
         }
+        return [];
     };
     return $y($pid);
 }
 
 /**
  * @return array [pinfo, tree]
- * tree [
- *  ppid
- *  [...child pids]
- * ]
- * list(ppid, array childs) = tree[pid]
+ *               tree [
+ *               ppid
+ *               [...child pids]
+ *               ]
+ *               list(ppid, array childs) = tree[pid]
  */
 function pstree()
 {
     $pinfo = [];
-    $iter = new DirectoryIterator("/proc");
+    $iter = new DirectoryIterator('/proc');
     foreach ($iter as $item) {
         $pid = $item->getFilename();
         if ($item->isDir() && ctype_digit($pid)) {
-            $stat = file_get_contents("/proc/$pid/stat");
-            $info = explode(" ", $stat);
-            $pinfo[$pid] = [intval($info[3]), []/*, $info*/];
+            $stat = file_get_contents("/proc/{$pid}/stat");
+            $info = explode(' ', $stat);
+            $pinfo[$pid] = [intval($info[3]), []/* , $info */];
         }
     }
     foreach ($pinfo as $pid => $info) {
-        list($ppid,) = $info;
+        [$ppid] = $info;
         $ppid = intval($ppid);
         $pinfo[$ppid][1][] = $pid;
     }
     $y = function ($pid, $path = []) use (&$y, $pinfo) {
         if (isset($pinfo[$pid])) {
-            list($ppid,) = $pinfo[$pid];
-            $ppid = $ppid;
+            if (isset($pinfo[$pid][0])) {
+                [$ppid] = $pinfo[$pid];
+            } else {
+                $ppid = null;
+            }
             $path[] = $pid;
             return $y($ppid, $path);
-        } else {
-            return array_reverse($path);
         }
+        return array_reverse($path);
     };
     $tree = [];
     foreach ($pinfo as $pid => $info) {
@@ -523,9 +759,9 @@ function debug_log($str, $handle = STDERR)
         $tpl = "[%d %s] %s\n";
     }
     if (is_resource($handle)) {
-        fprintf($handle, $tpl, posix_getpid(), date("Y-m-d H:i:s", time()), $str);
+        fprintf($handle, $tpl, posix_getpid(), date('Y-m-d H:i:s', time()), $str);
     } else {
-        printf($tpl, posix_getpid(), date("Y-m-d H:i:s", time()), $str);
+        printf($tpl, posix_getpid(), date('Y-m-d H:i:s', time()), $str);
     }
 }
 
@@ -547,21 +783,20 @@ function arrayEqual(array $a, array $b, $strict = true)
             }
         }
         return true;
-    } else {
-        $aks = array_keys($a);
-        $bks = array_keys($b);
-        sort($aks);
-        sort($bks);
-        return $aks === $bks;
     }
+    $aks = array_keys($a);
+    $bks = array_keys($b);
+    sort($aks);
+    sort($bks);
+    return $aks === $bks;
 }
 
 function check_tcp_port(string $host, int $port): bool
 {
-    return !!@fsockopen($host, $port);
+    return (bool) @fsockopen($host, $port);
 }
 
-function start_server($file, $host, $port, $redirect_file = "/dev/null", $ext1 = null, $ext2 = null, $debug = false)
+function start_server($file, $host, $port, $redirect_file = '/dev/null', $ext1 = null, $ext2 = null, $debug = false)
 {
     $php_executable = getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY;
     $cmd_args = getenv('TEST_PHP_ARGS');
@@ -580,27 +815,27 @@ function start_server($file, $host, $port, $redirect_file = "/dev/null", $ext1 =
     }*/
     // 必须加exec, 否咋proc_terminate结束不了server进程 ！！！！！！
     if ($debug) {
-        $cmd = "exec $php_executable $file $host $port $ext1 $ext2";
-        echo "[SHELL_EXEC]" . $cmd . "\n";
+        $cmd = "exec {$php_executable} {$file} {$host} {$port} {$ext1} {$ext2}";
+        echo '[SHELL_EXEC]' . $cmd . "\n";
     } else {
-        $cmd = "exec $php_executable $file $host $port $ext1 $ext2 > $redirect_file 2>&1";
+        $cmd = "exec {$php_executable} {$file} {$host} {$port} {$ext1} {$ext2} > {$redirect_file} 2>&1";
     }
     // $cmd = "exec $php_executable $file $host $port";
     $handle = proc_open($cmd, $fdSpec, $pipes);
     if ($handle === false) {
-        exit(__FUNCTION__ . " fail");
+        exit(__FUNCTION__ . ' fail');
     }
     make_sure_server_listen_success:
-    {
+
         $i = 0;
-        $fp = null;
-        while (($i++ < 30) && !($fp = @fsockopen($host, $port))) {
-            usleep(10000);
-        }
-        if ($fp) {
-            fclose($fp);
-        }
+    $fp = null;
+    while (($i++ < 30) && !($fp = @fsockopen($host, $port))) {
+        usleep(10000);
     }
+    if ($fp) {
+        fclose($fp);
+    }
+
     // linux上有问题，client端事件循环还没起起来就会先调用这个shutdown回调, 结束了子进程
     // 第二个shutdown_function swoole才会把子进程的事件循环起来
     //    register_shutdown_function(function() use($handle, $redirect_file) {
@@ -611,37 +846,38 @@ function start_server($file, $host, $port, $redirect_file = "/dev/null", $ext1 =
     return function () use ($handle, $redirect_file) {
         // @unlink($redirect_file);
         proc_terminate($handle, SIGTERM);
-        swoole_event_exit();
+        Event::exit();
         exit;
     };
 }
 
 function swoole_fork_exec(callable $fn, bool $redirect_stdin_and_stdout = false, int $pipe_type = SOCK_DGRAM, bool $enable_coroutine = false)
 {
-    $process = new Swoole\Process(...func_get_args());
+    $process = new Process(...func_get_args());
     if (!$process->start()) {
         return false;
     }
     return $process::wait();
 }
 
-function fork_exec(callable $fn, $f_stdout = "/dev/null", $f_stderr = null)
+function php_fork_exec(callable $fn, $f_stdout = '/dev/null', $f_stderr = null)
 {
     $pid = pcntl_fork();
     if ($pid < 0) {
-        exit("fork fail");
+        exit('fork fail');
     }
     if ($pid === 0) {
         fclose(STDOUT);
-        $STDOUT = fopen($f_stdout, "w");
+        $STDOUT = fopen($f_stdout, 'w');
         if ($f_stderr !== null) {
             fclose(STDERR);
-            $STDERR = fopen($f_stderr, "w");
+            $STDERR = fopen($f_stderr, 'w');
         }
         $fn();
         exit;
     }
     pcntl_waitpid($pid, $status);
+    return ['pid' => $pid, 'status', $status];
 }
 
 /**
@@ -651,17 +887,17 @@ function fork_exec(callable $fn, $f_stdout = "/dev/null", $f_stderr = null)
  * @param null|int $tv_sec timeout sec
  * @param null|int $tv_usec timeout usec
  * @param null|string $cwd change work dir
- * @param array|null $env env
+ * @param null|array $env env
  * @return array [out, err]
  */
-function spawn_exec($cmd, $input = null, $tv_sec = null, $tv_usec = null, $cwd = null, array $env = null)
+function spawn_exec($cmd, $input = null, $tv_sec = null, $tv_usec = null, $cwd = null, ?array $env = null)
 {
     $out = $err = null;
     $winOpt = ['suppress_errors' => true, 'binary_pipes' => true];
     $proc = proc_open($cmd, [
-        0 => ["pipe", "r"],
-        1 => ["pipe", "w"],
-        2 => ["pipe", "w"],
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
     ], $pipes, $cwd, $env, $winOpt);
     assert($proc !== false);
     if ($input !== null) {
@@ -679,39 +915,35 @@ function spawn_exec($cmd, $input = null, $tv_sec = null, $tv_usec = null, $cwd =
         $r = $pipes;
         $w = null;
         $e = null;
-        /* 隐藏被信号或者其他系统调用打断 产生的错误*/
-        set_error_handler(function () {
-        });
+        /* 隐藏被信号或者其他系统调用打断 产生的错误 */
+        set_error_handler(function () {});
         $n = @stream_select($r, $w, $e, $tv_sec, $tv_usec);
         restore_error_handler();
         if ($n === false) {
             break;
-        } else {
-            if ($n === 0) {
-                // 超时kill -9
-                assert(proc_terminate($proc, SIGKILL));
-                throw new \RuntimeException("exec $cmd time out");
-            } else {
-                if ($n > 0) {
-                    foreach ($r as $handle) {
-                        if ($handle === $pipes[1]) {
-                            $_ = &$out;
-                        } else {
-                            if ($handle === $pipes[2]) {
-                                $_ = &$err;
-                            } else {
-                                $_ = "";
-                            }
-                        }
-                        $line = fread($handle, 8192);
-                        $isEOF = $line === "";
-                        if ($isEOF) {
-                            break 2;
-                        } else {
-                            $_ .= $line;
-                        }
+        }
+        if ($n === 0) {
+            // 超时kill -9
+            assert(proc_terminate($proc, SIGKILL));
+            throw new RuntimeException("exec {$cmd} time out");
+        }
+        if ($n > 0) {
+            foreach ($r as $handle) {
+                if ($handle === $pipes[1]) {
+                    $_ = &$out;
+                } else {
+                    if ($handle === $pipes[2]) {
+                        $_ = &$err;
+                    } else {
+                        $_ = '';
                     }
                 }
+                $line = fread($handle, 8192);
+                $isEOF = $line === '';
+                if ($isEOF) {
+                    break 2;
+                }
+                $_ .= $line;
             }
         }
     }
@@ -729,20 +961,19 @@ function parent_child($parentFunc, $childFunc)
 {
     $pid = pcntl_fork();
     if ($pid < 0) {
-        echo "ERROR";
+        echo 'ERROR';
         exit;
     }
     if ($pid === 0) {
         $childFunc();
         exit;
-    } else {
-        $parentFunc($pid);
     }
+    $parentFunc($pid);
 }
 
-function readfile_with_lock($file)
+function readfile_with_lock($file): string
 {
-    $fp = fopen($file, "r+");
+    $fp = fopen($file, 'r+');
     flock($fp, LOCK_SH);
     $data = '';
     while (!feof($fp)) {
@@ -754,7 +985,7 @@ function readfile_with_lock($file)
 
 function dump_to_file($file, $data)
 {
-    $fp = fopen($file, "w+");
+    $fp = fopen($file, 'w+');
     $out = bin2hex($data);
     $lines = str_split($out, 160);
     foreach ($lines as $l) {
@@ -763,11 +994,90 @@ function dump_to_file($file, $data)
     fclose($fp);
 }
 
-function curl_type_assert($ch, $resource_type, $class_type)
+function curl_type_assert($ch, $resource_type, $class_type): void
 {
     if (PHP_VERSION_ID >= 80000) {
         Assert::isInstanceOf($ch, $class_type);
     } else {
         Assert::eq(get_resource_type($ch), $resource_type);
     }
+}
+
+function swoole_get_variance($avg, $array, $is_swatch = false): bool|float
+{
+    $count = count($array);
+    if ($count == 1 && $is_swatch) {
+        return false;
+    }
+    if ($count > 0) {
+        $total_var = 0;
+        foreach ($array as $lv) {
+            $total_var += pow($lv - $avg, 2);
+        }
+        if ($count == 1 && $is_swatch) {
+            return false;
+        }
+        return $is_swatch ? sqrt($total_var / (count($array) - 1)) : sqrt($total_var / count($array));
+    }
+    return false;
+}
+
+function swoole_get_average($array): float|int
+{
+    return array_sum($array) / count($array);
+}
+
+function assert_server_stats($stats): void
+{
+    Assert::keyExists($stats, 'connection_num');
+    Assert::keyExists($stats, 'request_count');
+}
+
+function assert_upload_file($file, $tmp_name, $name, $type, $size, $error = 0): void
+{
+    Assert::notEmpty($file);
+    Assert::eq($file['tmp_name'], $tmp_name);
+    Assert::eq($file['name'], $name);
+    Assert::eq($file['type'], $type);
+    Assert::eq($file['size'], $size);
+    Assert::eq($file['error'], $error);
+}
+
+function swoole_loop_n($n, $fn): void
+{
+    for ($i = 0; $i < $n; $i++) {
+        $fn($i);
+    }
+}
+
+function swoole_loop($fn)
+{
+    $i = 0;
+    while (true) {
+        $fn($i++);
+    }
+}
+
+function build_ftp_url(string $path = ''): string
+{
+    return 'ftp://' . FTP_USER . ':' . FTP_PASS . '@' . FTP_HOST . ':' . FTP_PORT . '/' . $path;
+}
+
+function get_thread_name(): string
+{
+    return trim(file_get_contents('/proc/' . posix_getpid() . '/task/' . Thread::getNativeId() . '/comm'));
+}
+
+function mkdir_if_not_exists(string $string): void
+{
+    if (!is_dir($string)) {
+        mkdir($string, 0777, true);
+    }
+}
+
+function array_arrange($array): array
+{
+    $list = array_keys(array_flip($array));
+    sort($list);
+    return $list;
 }

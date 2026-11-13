@@ -32,6 +32,11 @@ $pm->childFunc = function () use ($pm) {
         'open_eof_check' => true,
         'package_eof'    => "\r\n\r\n",
     ]);
+    $server->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $server->on('Receive', function ($server, $fd, $reactor_id, $data) {
         echo $data;
         $server->close($fd);
@@ -47,4 +52,4 @@ $pm->run();
 GET http://127.0.0.1:1234/ HTTP/1.1
 Host: 127.0.0.1:1234
 Connection: keep-alive
-Accept-Encoding: gzip, deflate
+Accept-Encoding: gzip, deflate, br

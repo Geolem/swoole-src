@@ -10,16 +10,16 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
 
 #pragma once
 
-#include "swoole.h"
 #include "swoole_heap.h"
 #include "swoole_reactor.h"
+#include "swoole_util.h"
 
 #include <unordered_map>
 
@@ -29,117 +29,129 @@
 #define SW_TIMER_MAX_SEC ((double) LONG_MAX / 1000)
 
 namespace swoole {
-
-typedef std::function<void(TimerNode *)> TimerDestructor;
+typedef void (*TimerDestructor)(TimerNode *);
 
 struct TimerNode {
     enum Type {
         TYPE_KERNEL,
-        TYPE_PHP,
+        TYPE_USER,
     };
     long id;
-    enum Type type;
+    Type type;
+    bool removed;
     int64_t exec_msec;
     int64_t interval;
+    uint64_t exec_count;
     uint64_t round;
-    bool removed;
     HeapNode *heap_node;
     TimerCallback callback;
     void *data;
-    TimerDestructor destructor;
 };
 
 class Timer {
-  private:
     /*--------------signal timer--------------*/
     Reactor *reactor_ = nullptr;
     Heap heap;
     std::unordered_map<long, TimerNode *> map;
-    uint64_t round;
     long _next_id;
     long _current_id;
     /*---------------event timer--------------*/
-    struct timeval base_time;
+    int64_t base_time;
+    /**
+     * The time when the next timer will trigger, in milliseconds.
+     * This event will serve as the timeout for the event loop's epoll/poll/kqueue,
+     * or be set as the trigger time for the system clock.
+     */
+    int64_t next_msec_;
     /*----------------------------------------*/
-    int (*set)(Timer *timer, long exec_msec) = nullptr;
-    void (*close)(Timer *timer) = nullptr;
+    std::function<int(Timer *timer, long exec_msec)> set;
+    std::function<void(Timer *timer)> close;
 
-    bool init_reactor(Reactor *reactor);
-    bool init_system_timer();
+    void init(bool manually_trigger);
+    void init_with_reactor(Reactor *reactor);
+    void init_with_system_timer();
+    void release_node(TimerNode *tnode);
 
   public:
-    long next_msec_;
+    // Set before creating user timers or starting worker threads; returns the previous handler.
+    // Passing nullptr restores the default no-op destructor.
+    static TimerDestructor set_user_destructor(TimerDestructor destructor);
 
-    Timer();
+    explicit Timer(bool manually_trigger);
     ~Timer();
-    static int now(struct timeval *time);
 
-    inline int64_t get_relative_msec() {
-        struct timeval _now;
-        if (now(&_now) < 0) {
-            return SW_ERR;
-        }
-        int64_t msec1 = (_now.tv_sec - base_time.tv_sec) * 1000;
-        int64_t msec2 = (_now.tv_usec - base_time.tv_usec) / 1000;
-        return msec1 + msec2;
+    int64_t get_relative_msec() const {
+        return get_absolute_msec() - base_time;
     }
 
-    inline static int64_t get_absolute_msec() {
-        struct timeval now;
-        if (Timer::now(&now) < 0) {
-            return SW_ERR;
-        }
-        int64_t msec1 = (now.tv_sec) * 1000;
-        int64_t msec2 = (now.tv_usec) / 1000;
-        return msec1 + msec2;
+    int64_t get_next_msec() const {
+        return next_msec_;
     }
 
-    inline Reactor *get_reactor() {
+    static int64_t get_absolute_msec() {
+        return time<std::chrono::milliseconds>(true);
+    }
+
+    Reactor *get_reactor() const {
         return reactor_;
     }
 
-    bool init();
     TimerNode *add(long _msec, bool persistent, void *data, const TimerCallback &callback);
     bool remove(TimerNode *tnode);
-    void update(TimerNode *tnode) {
+    void update(const TimerNode *tnode) const {
         heap.change_priority(tnode->exec_msec, tnode->heap_node);
     }
-    void delay(TimerNode *tnode, long delay_ms) {
+    void delay(TimerNode *tnode, long delay_ms) const {
         long now_ms = get_relative_msec();
         tnode->exec_msec = (now_ms < 0 ? tnode->exec_msec : now_ms) + delay_ms;
         update(tnode);
     }
-    void reinit(Reactor *reactor);
-    int select();
+    void reinit(bool manually_trigger = false);
+    void select();
 
-    inline TimerNode *get(long id) {
-        auto it = map.find(id);
+    TimerNode *get(long id) {
+        const auto it = map.find(id);
         if (it == map.end()) {
             return nullptr;
-        } else {
-            return it->second;
         }
+        return it->second;
     }
 
-    inline TimerNode *get(long id, const enum TimerNode::Type type) {
+    TimerNode *get(long id, const TimerNode::Type type) {
         TimerNode *tnode = get(id);
         return (tnode && tnode->type == type) ? tnode : nullptr;
     }
 
-    inline size_t count() {
+    size_t count() const {
         return map.size();
     }
 
-    inline uint64_t get_round() {
-        return round;
+    uint64_t get_round() const {
+        return reactor_ ? reactor_->get_round() : 0;
     }
 
-    inline bool remove(long id) {
+    bool remove(long id) {
         return remove(get(id));
     }
 
-    inline const std::unordered_map<long, TimerNode *> &get_map() {
+    const std::unordered_map<long, TimerNode *> &get_map() {
         return map;
     }
 };
+
+static inline long sec2msec(const long sec) {
+    return sec * 1000;
+}
+
+static inline long sec2msec(const int sec) {
+    return sec * 1000;
+}
+
+static inline long sec2msec(const double sec) {
+    return static_cast<long>(sec * 1000);
+}
+
+static inline double msec2sec(const int msec) {
+    return static_cast<double>(msec) / 1000.0;
+}
 }  // namespace swoole

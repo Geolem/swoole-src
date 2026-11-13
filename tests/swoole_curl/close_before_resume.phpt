@@ -54,7 +54,7 @@ $pm->parentFunc = function () use ($pm) {
     echo "Done\n";
 };
 $pm->childFunc = function () use ($pm) {
-    $http = new Swoole\Http\Server("127.0.0.1", $pm->getFreePort());
+    $http = new Swoole\Http\Server("127.0.0.1", $pm->getFreePort(), SWOOLE_PROCESS);
     $http->set(['worker_num' => N, 'log_file' => '/dev/null']);
 
     $http->on("start", function ($server) use ($pm) {
@@ -71,8 +71,13 @@ $pm->childFirst();
 $pm->run();
 ?>
 --EXPECTF--
-Fatal error: Uncaught Swoole\Error: cURL is executing, cannot be operated in %s:%d
+Fatal error: Uncaught Swoole\Error: This cURL handle is currently executing in coroutine#%d, cannot be operated in %s:%d
 Stack trace:
 #0 %s(%d): curl_close(%s)
-#1 {main}
+%A
   thrown in %s on line %d
+
+ [Coroutine-%d] Stack trace:
+ -------------------------------------------------------------------
+#0 %s(%d): curl_exec(Object(CurlHandle))
+#1 [internal function]: {%s}()

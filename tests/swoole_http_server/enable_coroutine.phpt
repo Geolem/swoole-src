@@ -16,12 +16,17 @@ $pm->parentFunc = function () use ($pm) {
     });
 };
 $pm->childFunc = function () use ($pm) {
-    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort());
+    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $http->set([
         'enable_coroutine' => false, // close build-in coroutine
         'worker_num' => 1,
         'log_level' => SWOOLE_LOG_NONE,
     ]);
+    $http->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $http->on("request", function (Swoole\Http\Request $request, Swoole\Http\Response $response) {
         $response->header("Content-Type", "text/plain");
         if ($request->server['request_uri'] == '/co') {

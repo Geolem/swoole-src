@@ -1,12 +1,15 @@
 --TEST--
 swoole_timer: timer in manager
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_class_not_exist(Swoole\Server::class);
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 $pm = new ProcessManager;
-const RES_FILE = __DIR__.'/result.txt';
+const RES_FILE = __DIR__ . '/manager.result';
 file_put_contents(RES_FILE, "");
 
 //设置等待10秒
@@ -27,7 +30,7 @@ $pm->parentFunc = function ($pid) use ($pm)
 $pm->childFunc = function () use ($pm)
 {
     ini_set('swoole.display_errors', 'Off');
-    $serv = new swoole_server("0.0.0.0", $pm->getFreePort());
+    $serv = new Swoole\Server("0.0.0.0", $pm->getFreePort(), SWOOLE_PROCESS);
 
     $serv->set(array(
         'worker_num' => 1,
@@ -38,21 +41,21 @@ $pm->childFunc = function () use ($pm)
 
         file_put_contents(RES_FILE, "start\n", FILE_APPEND);
 
-        $id = swoole_timer_tick(300, function () {
+        $id = Swoole\Timer::tick(300, function () {
             file_put_contents(RES_FILE, "timer 1\n", FILE_APPEND);
         });
 
-        swoole_timer_after(900, function () use ($id, $serv, $pm) {
+        Swoole\Timer::after(900, function () use ($id, $serv, $pm) {
             file_put_contents(RES_FILE, "timer 2\n", FILE_APPEND);
-            swoole_timer_clear($id);
+            Swoole\Timer::clear($id);
 
-            swoole_timer_tick(200, function ($id) use ($serv, $pm) {
+            Swoole\Timer::tick(200, function ($id) use ($serv, $pm) {
                 static $i = 0;
                 file_put_contents(RES_FILE, "timer 3\n", FILE_APPEND);
                 $i ++;
                 if ($i > 4) {
                     file_put_contents(RES_FILE, "end\n", FILE_APPEND);
-                    swoole_timer_clear($id);
+                    Swoole\Timer::clear($id);
                     $pm->wakeup();
                     $serv->shutdown();
                 }
@@ -60,7 +63,7 @@ $pm->childFunc = function () use ($pm)
         });
     });
 
-    $serv->on('receive', function (swoole_server $serv, $fd, $reactor_id, $data) {
+    $serv->on('receive', function (Swoole\Server $serv, $fd, $reactor_id, $data) {
 
     });
 

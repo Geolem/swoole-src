@@ -18,7 +18,7 @@ class Process3 extends Swoole\Process
 
     public function run()
     {
-        swoole_timer_tick(100, function () {
+        Swoole\Timer::tick(100, function () {
             global $atomic;
             if ($atomic->add() > 5) {
                 global $pm;
@@ -69,4 +69,41 @@ Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
 sleep start then sleep end
 
 Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+DONE
+--EXPECTF_85--
+sleep start then sleep end
+
+Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+Stack trace:
+#0 %s(%d): trigger_error('ERROR', 256)
+#1 [internal function]: Process3->{closure:Process3::run():%d}(%d)
+#2 {main}
+sleep start then sleep end
+
+Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+Stack trace:
+#0 %s(%d): trigger_error('ERROR', 256)
+#1 [internal function]: Process3->{closure:Process3::run():%d}(%d)
+#2 {main}
+sleep start then sleep end
+
+Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+Stack trace:
+#0 %s(%d): trigger_error('ERROR', 256)
+#1 [internal function]: Process3->{closure:Process3::run():%d}(%d)
+#2 {main}
+sleep start then sleep end
+
+Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+Stack trace:
+#0 %s(%d): trigger_error('ERROR', 256)
+#1 [internal function]: Process3->{closure:Process3::run():%d}(%d)
+#2 {main}
+sleep start then sleep end
+
+Fatal error: ERROR in %s/tests/swoole_server/addProcess_with_tick.php on line %d
+Stack trace:
+#0 %s(%d): trigger_error('ERROR', 256)
+#1 [internal function]: Process3->{closure:Process3::run():%d}(%d)
+#2 {main}
 DONE

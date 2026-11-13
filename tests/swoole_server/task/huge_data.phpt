@@ -30,9 +30,14 @@ $pm->childFunc = function () use ($pm) {
         'log_file' => '/dev/null',
         'task_worker_num' => 4
     ]);
+    $http->on('WorkerStart', function (Swoole\Server $server, int $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $http->on('request', function (Swoole\Http\Request $request, Swoole\Http\Response $response) use ($http) {
         Assert::assert($response->detach());
-        $scope = IS_IN_TRAVIS ? [4, 16] : [16, 64];
+        $scope = IS_IN_CI ? [4, 16] : [16, 64];
         $repeat = mt_rand(...$scope);
         $http->task([
             'fd' => $response->fd,

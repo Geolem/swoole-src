@@ -10,16 +10,12 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #include "php_swoole_cxx.h"
-#include "php_streams.h"
-#include "php_network.h"
-
-#include "ext/standard/file.h"
-#include "ext/standard/basic_functions.h"
+#include "swoole_socket.h"
 
 #include <string>
 #include <vector>
@@ -30,83 +26,98 @@ using std::vector;
 using swoole::Coroutine;
 using swoole::PHPCoroutine;
 using swoole::Timer;
-using swoole::coroutine::Socket;
 
 struct DNSCacheEntity {
-    char address[16];
+    char address[INET6_ADDRSTRLEN];
     time_t update_time;
 };
 
-static std::unordered_map<std::string, DNSCacheEntity *> request_cache_map;
+static SW_THREAD_LOCAL std::unordered_map<std::string, DNSCacheEntity *> request_cache_map;
 
 void php_swoole_async_coro_rshutdown() {
-    for (auto i = request_cache_map.begin(); i != request_cache_map.end(); i++) {
+    for (auto i = request_cache_map.begin(); i != request_cache_map.end(); ++i) {
         efree(i->second);
     }
+    request_cache_map.clear();
 }
 
-void php_swoole_set_aio_option(HashTable *vht) {
+void php_swoole_set_aio_option(const HashTable *vht) try {
     zval *ztmp;
     /* AIO */
-   if (php_swoole_array_get_value(vht, "aio_core_worker_num", ztmp)) {
-       zend_long v = zval_get_long(ztmp);
-       v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
-       SwooleG.aio_core_worker_num = v;
-   }
-   if (php_swoole_array_get_value(vht, "aio_worker_num", ztmp)) {
-       zend_long v = zval_get_long(ztmp);
-       v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
-       SwooleG.aio_worker_num = v;
-   }
-   if (php_swoole_array_get_value(vht, "aio_max_wait_time", ztmp)) {
-       SwooleG.aio_max_wait_time = zval_get_double(ztmp);
-   }
-   if (php_swoole_array_get_value(vht, "aio_max_idle_time", ztmp)) {
-       SwooleG.aio_max_idle_time = zval_get_double(ztmp);
-   }
+    if (php_swoole_array_get_value(vht, "aio_core_worker_num", ztmp)) {
+        zend_long v = zend::setting::get_long(ztmp);
+        v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
+        SwooleG.aio_core_worker_num = v;
+    }
+    if (php_swoole_array_get_value(vht, "aio_worker_num", ztmp)) {
+        zend_long v = zend::setting::get_long(ztmp);
+        v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
+        SwooleG.aio_worker_num = v;
+    }
+    if (php_swoole_array_get_value(vht, "aio_max_wait_time", ztmp)) {
+        SwooleG.aio_max_wait_time = zend::setting::get_double(ztmp);
+    }
+    if (php_swoole_array_get_value(vht, "aio_max_idle_time", ztmp)) {
+        SwooleG.aio_max_idle_time = zend::setting::get_double(ztmp);
+    }
+#ifdef SW_USE_IOURING
+    if (php_swoole_array_get_value(vht, "iouring_entries", ztmp)) {
+        zend_long v = zend::setting::get_long(ztmp);
+        SwooleG.iouring_entries = SW_MAX(0, SW_MIN(v, UINT32_MAX));
+    }
+    if (php_swoole_array_get_value(vht, "iouring_workers", ztmp)) {
+        zend_long v = zend::setting::get_long(ztmp);
+        SwooleG.iouring_workers = SW_MAX(0, SW_MIN(v, UINT32_MAX));
+    }
+    if (php_swoole_array_get_value(vht, "iouring_flag", ztmp)) {
+        SwooleG.iouring_flag = zend::setting::get_long(ztmp);
+    }
+#endif
+} catch (const zend::setting::ParseError &) {
+    return;
 }
 
-PHP_FUNCTION(swoole_async_set) {
+PHP_FUNCTION(swoole_async_set) try {
+    SW_MUST_BE_MAIN_THREAD();
     if (sw_reactor()) {
-        php_swoole_fatal_error(E_ERROR, "eventLoop has already been created. unable to change settings");
-        RETURN_FALSE;
+        php_swoole_throw_setting_exception("eventLoop has already been created. unable to change settings");
+        RETURN_THROWS();
     }
 
     zval *zset = nullptr;
-    HashTable *vht;
     zval *ztmp;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
     Z_PARAM_ARRAY(zset)
     ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
 
-    vht = Z_ARRVAL_P(zset);
+    HashTable *vht = Z_ARRVAL_P(zset);
 
     php_swoole_set_global_option(vht);
-    php_swoole_set_aio_option(vht);
-
-    if (php_swoole_array_get_value(vht, "enable_signalfd", ztmp)) {
-        SwooleG.enable_signalfd = zval_is_true(ztmp);
+    if (UNEXPECTED(EG(exception))) {
+        RETURN_THROWS();
     }
+    php_swoole_set_aio_option(vht);
+    if (UNEXPECTED(EG(exception))) {
+        RETURN_THROWS();
+    }
+
     if (php_swoole_array_get_value(vht, "wait_signal", ztmp)) {
         SwooleG.wait_signal = zval_is_true(ztmp);
     }
     if (php_swoole_array_get_value(vht, "dns_cache_refresh_time", ztmp)) {
-        SwooleG.dns_cache_refresh_time = zval_get_double(ztmp);
+        SwooleG.dns_cache_refresh_time = zend::setting::get_double(ztmp);
     }
     if (php_swoole_array_get_value(vht, "thread_num", ztmp) ||
         php_swoole_array_get_value(vht, "min_thread_num", ztmp)) {
-        zend_long v = zval_get_long(ztmp);
+        zend_long v = zend::setting::get_long(ztmp);
         v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
         SwooleG.aio_core_worker_num = v;
     }
     if (php_swoole_array_get_value(vht, "max_thread_num", ztmp)) {
-        zend_long v = zval_get_long(ztmp);
+        zend_long v = zend::setting::get_long(ztmp);
         v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
         SwooleG.aio_worker_num = v;
-    }
-    if (php_swoole_array_get_value(vht, "socket_dontwait", ztmp)) {
-        SwooleG.socket_dontwait = zval_is_true(ztmp);
     }
     if (php_swoole_array_get_value(vht, "dns_lookup_random", ztmp)) {
         SwooleG.dns_lookup_random = zval_is_true(ztmp);
@@ -115,18 +126,26 @@ PHP_FUNCTION(swoole_async_set) {
         SwooleG.use_async_resolver = zval_is_true(ztmp);
     }
     if (php_swoole_array_get_value(vht, "enable_coroutine", ztmp)) {
-        SWOOLE_G(enable_coroutine) = zval_is_true(ztmp);
+        SwooleG.enable_coroutine = zval_is_true(ztmp);
     }
+    RETURN_TRUE;
+} catch (const zend::setting::ParseError &) {
+    RETURN_THROWS();
 }
 
 PHP_FUNCTION(swoole_async_dns_lookup_coro) {
     Coroutine::get_current_safe();
 
     zval *domain;
+    zend_long type = AF_INET;
     double timeout = swoole::network::Socket::default_dns_timeout;
-    if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|d", &domain, &timeout) == FAILURE) {
-        RETURN_FALSE;
-    }
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+    Z_PARAM_ZVAL(domain)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_DOUBLE(timeout)
+    Z_PARAM_LONG(type)
+    ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
 
     if (Z_TYPE_P(domain) != IS_STRING) {
         php_swoole_fatal_error(E_WARNING, "invalid domain name");
@@ -139,7 +158,7 @@ PHP_FUNCTION(swoole_async_dns_lookup_coro) {
     }
 
     // find cache
-    std::string key(Z_STRVAL_P(domain), Z_STRLEN_P(domain));
+    std::string key = std::to_string(type) + ":" + std::string(Z_STRVAL_P(domain), Z_STRLEN_P(domain));
     DNSCacheEntity *cache;
 
     if (request_cache_map.find(key) != request_cache_map.end()) {
@@ -151,14 +170,14 @@ PHP_FUNCTION(swoole_async_dns_lookup_coro) {
 
     php_swoole_check_reactor();
 
-    vector<string> result = swoole::coroutine::dns_lookup(Z_STRVAL_P(domain), timeout);
+    vector<string> result = swoole::coroutine::dns_lookup(Z_STRVAL_P(domain), type, timeout);
     if (result.empty()) {
         swoole_set_last_error(SW_ERROR_DNSLOOKUP_RESOLVE_FAILED);
         RETURN_FALSE;
     }
 
     if (SwooleG.dns_lookup_random) {
-        RETVAL_STRING(result[rand() % result.size()].c_str());
+        RETVAL_STRING(result[swoole_rand() % result.size()].c_str());
     } else {
         RETVAL_STRING(result[0].c_str());
     }
@@ -172,5 +191,5 @@ PHP_FUNCTION(swoole_async_dns_lookup_coro) {
     }
     memcpy(cache->address, Z_STRVAL_P(return_value), Z_STRLEN_P(return_value));
     cache->address[Z_STRLEN_P(return_value)] = '\0';
-    cache->update_time = Timer::get_absolute_msec() + (int64_t)(SwooleG.dns_cache_refresh_time * 1000);
+    cache->update_time = Timer::get_absolute_msec() + (int64_t) (SwooleG.dns_cache_refresh_time * 1000);
 }

@@ -3,12 +3,13 @@ swoole_runtime: udg
 --SKIPIF--
 <?php
 require __DIR__ . '/../include/skipif.inc';
+skip_if_darwin();
 ?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
-swoole\runtime::enableCoroutine();
+Swoole\Runtime::enableCoroutine();
 const N = 5;
 
 go(function () {
@@ -34,7 +35,7 @@ go(function () {
         fclose($fp);
     }
 });
-swoole_event_wait();
+Swoole\Event::wait();
 ?>
 --EXPECT--
 [Server] recv : hello-0

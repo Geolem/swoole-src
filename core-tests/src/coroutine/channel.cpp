@@ -1,9 +1,86 @@
 #include "test_coroutine.h"
+#include "swoole_util.h"
 
+using swoole::Coroutine;
 using swoole::coroutine::Channel;
+using swoole::coroutine::ChannelImpl;
 
 using namespace std;
 using namespace swoole::test;
+
+TEST(coroutine_channel, failed_suspension_removes_waiter_timer_and_cancel_callback) {
+    coroutine::run([](void *) {
+        Channel chan(1);
+        auto *co = Coroutine::get_current();
+        int task = 0;
+        co->set_task(&task);
+        Coroutine::set_on_yield([](void *) { throw std::runtime_error("suspension failed"); });
+        ON_SCOPE_EXIT {
+            Coroutine::set_on_yield(nullptr);
+            co->set_task(nullptr);
+        };
+        const auto timer_count = [] { return swoole_timer_is_available() ? sw_timer()->count() : 0; };
+        const auto initial_timer_count = timer_count();
+        EXPECT_THROW(chan.pop(60), std::runtime_error);
+        EXPECT_EQ(chan.consumer_num(), 0u);
+        EXPECT_EQ(timer_count(), initial_timer_count);
+        EXPECT_FALSE(co->cancel());
+        EXPECT_TRUE(chan.push_data(nullptr));
+        EXPECT_THROW(chan.push(nullptr, 60), std::runtime_error);
+        EXPECT_EQ(chan.producer_num(), 0u);
+        EXPECT_EQ(timer_count(), initial_timer_count);
+        EXPECT_FALSE(co->cancel());
+        EXPECT_TRUE(chan.close());
+    });
+}
+
+TEST(coroutine_channel, direct_push_pop_data_boundaries) {
+    for (auto capacity : {1, 2, 3, 4, 8, 16, 17}) {
+        ChannelImpl<int> chan(capacity);
+
+        ASSERT_TRUE(chan.is_empty());
+        ASSERT_FALSE(chan.is_full());
+        ASSERT_EQ(chan.length(), 0);
+
+        for (int i = 0; i < capacity; i++) {
+            ASSERT_TRUE(chan.push_data(i));
+            ASSERT_EQ(chan.length(), i + 1);
+        }
+
+        ASSERT_TRUE(chan.is_full());
+        ASSERT_FALSE(chan.is_empty());
+        ASSERT_FALSE(chan.push_data(capacity));
+        ASSERT_EQ(chan.get_error(), ChannelImpl<int>::ERROR_TIMEOUT);
+        ASSERT_EQ(chan.length(), capacity);
+
+        for (int i = 0; i < capacity; i++) {
+            int value = -1;
+            ASSERT_TRUE(chan.pop_data(&value));
+            ASSERT_EQ(value, i);
+            ASSERT_EQ(chan.length(), capacity - i - 1);
+        }
+
+        ASSERT_TRUE(chan.is_empty());
+        ASSERT_FALSE(chan.is_full());
+        int value = -1;
+        ASSERT_FALSE(chan.pop_data(&value));
+        ASSERT_EQ(value, -1);
+    }
+}
+
+TEST(coroutine_channel, direct_zero_capacity_uses_one_slot) {
+    ChannelImpl<int> chan(0);
+
+    ASSERT_TRUE(chan.push_data(1));
+    ASSERT_TRUE(chan.is_full());
+    ASSERT_EQ(chan.length(), 1);
+    ASSERT_FALSE(chan.push_data(2));
+
+    int value = 0;
+    ASSERT_TRUE(chan.pop_data(&value));
+    ASSERT_EQ(value, 1);
+    ASSERT_TRUE(chan.is_empty());
+}
 
 TEST(coroutine_channel, push_pop) {
     coroutine::run([](void *arg) {
@@ -88,4 +165,61 @@ TEST(coroutine_channel, pop_timeout) {
         ret = chan.pop(0.001);
         ASSERT_EQ(ret, nullptr);
     });
+}
+
+TEST(coroutine_channel, close) {
+    Channel chan(1);
+    coroutine::run(
+        [](void *arg) {
+            int value = 1;
+            auto chan = (Channel *) arg;
+            while (1) {
+                if (!chan->push((void *) &value)) {
+                    ASSERT_EQ(chan->get_error(), Channel::ErrorCode::ERROR_CLOSED);
+                    ASSERT_FALSE(chan->push(nullptr));
+                    break;
+                }
+            }
+        },
+        &chan);
+
+    ASSERT_TRUE(chan.close());
+    ASSERT_FALSE(chan.close());
+
+    Channel chan2(1);
+    coroutine::run(
+        [](void *arg) {
+            auto chan = (Channel *) arg;
+            while (1) {
+                if (!chan->pop(0)) {
+                    ASSERT_EQ(chan->get_error(), Channel::ErrorCode::ERROR_CLOSED);
+                    ASSERT_EQ(chan->pop(), nullptr);
+                    break;
+                }
+            }
+        },
+        &chan2);
+
+    ASSERT_TRUE(chan2.close());
+}
+
+TEST(coroutine_channel, cancel) {
+    Channel chan(1);
+
+    coroutine::run(
+        [](void *arg) {
+            auto chan = (Channel *) arg;
+            auto cid = Coroutine::create([chan](void *args) {
+                ASSERT_EQ(chan->pop(), nullptr);
+                ASSERT_EQ(chan->get_error(), Channel::ERROR_CANCELED);
+            });
+
+            auto co = Coroutine::get_by_cid(cid);
+            ASSERT_TRUE(co->cancel());
+            ASSERT_TRUE(chan->close());
+
+            ASSERT_EQ(chan->pop(), nullptr);
+            ASSERT_EQ(chan->get_error(), Channel::ERROR_CLOSED);
+        },
+        &chan);
 }

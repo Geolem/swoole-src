@@ -10,176 +10,173 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include <poll.h>
-
-#include "swoole.h"
 #include "swoole_socket.h"
 #include "swoole_reactor.h"
 
 namespace swoole {
-
 using network::Socket;
 
-class ReactorPoll : public ReactorImpl {
-    uint32_t max_fd_num;
-    Socket **fds_;
-    struct pollfd *events_;
-    bool exists(int fd);
+class ReactorPoll final : public ReactorImpl {
+    std::unique_ptr<pollfd[]> events_;
+    std::unique_ptr<Socket *[]> event_sockets_;
+    int max_events_;
+    int set_events() const;
 
   public:
     ReactorPoll(Reactor *_reactor, int max_events);
-    ~ReactorPoll();
+    ~ReactorPoll() override = default;
     bool ready() override {
         return true;
     };
     int add(Socket *socket, int events) override;
     int set(Socket *socket, int events) override;
     int del(Socket *socket) override;
-    int wait(struct timeval *) override;
+    int wait() override;
 };
 
 ReactorImpl *make_reactor_poll(Reactor *_reactor, int max_events) {
     return new ReactorPoll(_reactor, max_events);
 }
 
-ReactorPoll::ReactorPoll(Reactor *_reactor, int max_events) : ReactorImpl(_reactor) {
-    fds_ = new Socket *[max_events];
-    events_ = new struct pollfd[max_events];
-
-    max_fd_num = max_events;
+ReactorPoll::ReactorPoll(Reactor *_reactor, int max_events)
+    : ReactorImpl(_reactor),
+      events_(new pollfd[max_events]),
+      event_sockets_(new Socket *[max_events]),
+      max_events_(max_events) {
     reactor_->max_event_num = max_events;
 }
 
-ReactorPoll::~ReactorPoll() {
-    delete[] fds_;
-    delete[] events_;
+int ReactorPoll::set_events() const {
+    const auto &sockets = reactor_->get_sockets();
+    int count = 0;
+    for (const auto &pair : sockets) {
+        const auto _socket = pair.second;
+        events_[count].fd = _socket->fd;
+        events_[count].events = translate_events_to_poll(_socket->events);
+        events_[count].revents = 0;
+        event_sockets_[count] = _socket;
+        count++;
+    }
+    return count;
 }
 
-int ReactorPoll::add(Socket *socket, int events) {
-    int fd = socket->fd;
-    if (exists(fd)) {
-        swWarn("fd#%d is already exists", fd);
+int ReactorPoll::add(Socket *socket, const int events) {
+    if (reactor_->_exists(socket)) {
+        swoole_error_log(
+            SW_LOG_WARNING,
+            SW_ERROR_EVENT_ADD_FAILED,
+            "[Reactor#%d] failed to add events[fd=%d, fd_type=%d, events=%d], the socket#%d is already exists",
+            reactor_->id,
+            socket->fd,
+            socket->fd_type,
+            events,
+            socket->fd);
+        swoole_print_backtrace_on_error();
         return SW_ERR;
     }
 
-    int cur = reactor_->event_num;
-    if (reactor_->event_num == max_fd_num) {
-        swWarn("too many connection, more than %d", max_fd_num);
+    if (reactor_->get_event_num() == static_cast<size_t>(max_events_)) {
+        swoole_error_log(
+            SW_LOG_WARNING, SW_ERROR_EVENT_ADD_FAILED, "too many sockets, the max events is %d", max_events_);
+        swoole_print_backtrace_on_error();
         return SW_ERR;
     }
 
+    swoole_trace("fd=%d, events=%d", socket->fd, events);
     reactor_->_add(socket, events);
-
-    swTrace("fd=%d, events=%d", fd, events);
-
-    fds_[cur] = socket;
-    events_[cur].fd = fd;
-    events_[cur].events = 0;
-
-    if (Reactor::isset_read_event(events)) {
-        events_[cur].events |= POLLIN;
-    }
-    if (Reactor::isset_write_event(events)) {
-        events_[cur].events |= POLLOUT;
-    }
-    if (Reactor::isset_error_event(events)) {
-        events_[cur].events |= POLLHUP;
-    }
 
     return SW_OK;
 }
 
 int ReactorPoll::set(Socket *socket, int events) {
-    uint32_t i;
-
-    swTrace("fd=%d, events=%d", socket->fd, events);
-
-    for (i = 0; i < reactor_->event_num; i++) {
-        // found
-        if (events_[i].fd == socket->fd) {
-            events_[i].events = 0;
-            if (Reactor::isset_read_event(events)) {
-                events_[i].events |= POLLIN;
-            }
-            if (Reactor::isset_write_event(events)) {
-                events_[i].events |= POLLOUT;
-            }
-            // execute parent method
-            reactor_->_set(socket, events);
-            return SW_OK;
-        }
+    if (!reactor_->_exists(socket)) {
+        swoole_error_log(
+            SW_LOG_WARNING,
+            SW_ERROR_SOCKET_NOT_EXISTS,
+            "[Reactor#%d] failed to set events[fd=%d, fd_type=%d, events=%d], the socket#%d has already been removed",
+            reactor_->id,
+            socket->fd,
+            socket->fd_type,
+            events,
+            socket->fd);
+        swoole_print_backtrace_on_error();
+        return SW_ERR;
     }
 
-    return SW_ERR;
+    swoole_trace("fd=%d, events=%d", socket->fd, events);
+    reactor_->_set(socket, events);
+
+    return SW_OK;
 }
 
 int ReactorPoll::del(Socket *socket) {
     if (socket->removed) {
-        swoole_error_log(SW_LOG_WARNING,
-                         SW_ERROR_EVENT_SOCKET_REMOVED,
-                         "failed to delete event[%d], it has already been removed",
-                         socket->fd);
+        swoole_error_log(
+            SW_LOG_WARNING,
+            SW_ERROR_SOCKET_NOT_EXISTS,
+            "[Reactor#%d] failed to delete events[fd=%d, fd_type=%d], the socket#%d has already been removed",
+            reactor_->id,
+            socket->fd,
+            socket->fd_type,
+            socket->fd);
+        swoole_print_backtrace_on_error();
         return SW_ERR;
     }
 
-    for (uint32_t i = 0; i < reactor_->event_num; i++) {
-        if (events_[i].fd == socket->fd) {
-            for (; i < reactor_->event_num; i++) {
-                if (i == reactor_->event_num) {
-                    fds_[i] = nullptr;
-                    events_[i].fd = 0;
-                    events_[i].events = 0;
-                } else {
-                    fds_[i] = fds_[i + 1];
-                    events_[i] = events_[i + 1];
-                }
-            }
-            reactor_->_del(socket);
-            return SW_OK;
-        }
+    if (!reactor_->_exists(socket)) {
+        swoole_error_log(SW_LOG_WARNING,
+                         SW_ERROR_SOCKET_NOT_EXISTS,
+                         "[Reactor#%d] failed to delete events[fd=%d, fd_type=%d], the socket#%d is not exists",
+                         reactor_->id,
+                         socket->fd,
+                         socket->fd_type,
+                         socket->fd);
+        swoole_print_backtrace_on_error();
+        return SW_ERR;
     }
-
-    return SW_ERR;
+    swoole_trace("fd=%d", socket->fd);
+    reactor_->_del(socket);
+    return SW_OK;
 }
 
-int ReactorPoll::wait(struct timeval *timeo) {
+int ReactorPoll::wait() {
     Event event;
     ReactorHandler handler;
-
-    int ret;
-
-    if (reactor_->timeout_msec == 0) {
-        if (timeo == nullptr) {
-            reactor_->timeout_msec = -1;
-        } else {
-            reactor_->timeout_msec = timeo->tv_sec * 1000 + timeo->tv_usec / 1000;
-        }
-    }
 
     reactor_->before_wait();
 
     while (reactor_->running) {
-        if (reactor_->onBegin != nullptr) {
-            reactor_->onBegin(reactor_);
+        reactor_->execute_begin_callback();
+        if (sw_unlikely(reactor_->terminated)) {
+            break;
         }
-        ret = poll(events_, reactor_->event_num, reactor_->get_timeout_msec());
+        const int event_num = set_events();
+        int ret;
+        ret = poll(events_.get(), event_num, reactor_->get_timeout_msec());
         if (ret < 0) {
             if (!reactor_->catch_error()) {
-                swSysWarn("poll error");
+                swoole_sys_warning("[Reactor#%d] poll(nfds=%d, timeout=%d) failed",
+                                   reactor_->id,
+                                   event_num,
+                                   reactor_->get_timeout_msec());
                 break;
-            } else {
-                goto _continue;
             }
         } else if (ret == 0) {
             reactor_->execute_end_callbacks(true);
             SW_REACTOR_CONTINUE;
         } else {
-            for (uint32_t i = 0; i < reactor_->event_num; i++) {
-                event.socket = fds_[i];
+            for (int i = 0; i < event_num; i++) {
+                if (events_[i].revents == 0) {
+                    continue;
+                }
+
+                // An earlier handler may remove a socket and register a new one on the same fd, so dispatch the
+                // socket this entry was built from rather than whichever socket now holds that fd.
+                event.socket = event_sockets_[i];
                 event.fd = events_[i].fd;
                 event.reactor_id = reactor_->id;
                 event.type = event.socket->fd_type;
@@ -187,22 +184,23 @@ int ReactorPoll::wait(struct timeval *timeo) {
                 if (events_[i].revents & (POLLHUP | POLLERR)) {
                     event.socket->event_hup = 1;
                 }
-
-                swTrace("Event: fd=%d|reactor_id=%d|type=%d", event.fd, reactor_->id, event.type);
+                swoole_trace("Event: fd=%d|reactor_id=%d|type=%d", event.fd, reactor_->id, event.type);
                 // in
                 if ((events_[i].revents & POLLIN) && !event.socket->removed) {
-                    handler = reactor_->get_handler(SW_EVENT_READ, event.type);
+                    handler = reactor_->get_handler(event.type, SW_EVENT_READ);
                     ret = handler(reactor_, &event);
                     if (ret < 0) {
-                        swSysWarn("poll[POLLIN] handler failed. fd=%d", event.fd);
+                        swoole_sys_warning("POLLIN handle failed. fd=%d", event.fd);
+                        swoole_print_backtrace_on_error();
                     }
                 }
                 // out
                 if ((events_[i].revents & POLLOUT) && !event.socket->removed) {
-                    handler = reactor_->get_handler(SW_EVENT_WRITE, event.type);
+                    handler = reactor_->get_handler(event.type, SW_EVENT_WRITE);
                     ret = handler(reactor_, &event);
                     if (ret < 0) {
-                        swSysWarn("poll[POLLOUT] handler failed. fd=%d", event.fd);
+                        swoole_sys_warning("POLLOUT handle failed. fd=%d", event.fd);
+                        swoole_print_backtrace_on_error();
                     }
                 }
                 // error
@@ -214,7 +212,8 @@ int ReactorPoll::wait(struct timeval *timeo) {
                     handler = reactor_->get_error_handler(event.type);
                     ret = handler(reactor_, &event);
                     if (ret < 0) {
-                        swSysWarn("poll[POLLERR] handler failed. fd=%d", event.fd);
+                        swoole_sys_warning("POLLERR handle failed. fd=%d", event.fd);
+                        swoole_print_backtrace_on_error();
                     }
                 }
                 if (!event.socket->removed && (event.socket->events & SW_EVENT_ONCE)) {
@@ -222,20 +221,10 @@ int ReactorPoll::wait(struct timeval *timeo) {
                 }
             }
         }
-    _continue:
         reactor_->execute_end_callbacks(false);
         SW_REACTOR_CONTINUE;
     }
     return SW_OK;
-}
-
-bool ReactorPoll::exists(int fd) {
-    for (uint32_t i = 0; i < reactor_->event_num; i++) {
-        if (events_[i].fd == fd) {
-            return true;
-        }
-    }
-    return false;
 }
 
 }  // namespace swoole
